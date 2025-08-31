@@ -107,6 +107,36 @@ func stripMethodURLPrefix(err error) error {
 	return err
 }
 
+// -------------------------------------------------
+// cloneRequest – deep copy of an *http.Request
+// -------------------------------------------------
+
+func cloneRequest(r *http.Request) *http.Request {
+	// Shallow copy of the request (includes URL, Method, etc.).
+	clone := r.Clone(r.Context())
+
+	// Deep‑copy the Header map (Clone already does this, but we keep it explicit).
+	clone.Header = make(http.Header, len(r.Header))
+	for k, vv := range r.Header {
+		vvCopy := make([]string, len(vv))
+		copy(vvCopy, vv)
+		clone.Header[k] = vvCopy
+	}
+
+	// If the body implements io.ReadSeeker (e.g., bytes.Reader, strings.Reader),
+	// rewind it so the next attempt reads from the beginning.
+	if r.Body != nil {
+		if seeker, ok := r.Body.(io.ReadSeeker); ok {
+			_, _ = seeker.Seek(0, io.SeekStart)
+			clone.Body = io.NopCloser(seeker)
+		} else {
+			// For non‑seekable bodies we cannot safely retry; keep the original reference.
+			clone.Body = r.Body
+		}
+	}
+	return clone
+}
+
 // New creates a new Client applying any supplied Options.
 func New(opts ...Option) *Client {
 	c := &Client{
@@ -156,125 +186,115 @@ type retryTransport struct {
 }
 
 // RoundTrip implements http.RoundTripper.
+// It adds metrics, circuit‑breaker checks, rate‑limiting, retries,
+// back‑off handling and response‑body preservation.
 func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	start := time.Now()
 	requestID := getRequestID(req.Context())
+
+	// ----- metrics: count incoming request -----
 	if t.client.metrics != nil {
 		t.client.metrics.IncRequests(req.Method, req.URL.String())
 	}
 
-	// -------------------------------------------------
-	// Circuit breaker check
-	// -------------------------------------------------
+	// ----- circuit‑breaker pre‑check -----
 	if t.client.circuitBreaker != nil {
 		if err := t.client.circuitBreaker.Allow(); err != nil {
-			// Return a plain error string (no method/URL prefix) so callers see exactly
-			// “circuit breaker: circuit open”.
 			logError(t.client.logger, "circuit breaker open", err, requestID)
 			recordFailure(t.client, req, 0)
 			return nil, errors.New("circuit breaker: circuit open")
 		}
 	}
 
-	// -------------------------------------------------
-	// Global rate limiting
-	// -------------------------------------------------
-	if t.client.limiter != nil {
-		if err := t.waitForRateLimit(req, requestID); err != nil {
+	// ----- rate‑limiter (dynamic) pre‑wait -----
+	if t.client.dynamicRateAdjustment && t.client.limiter != nil {
+		if err := t.client.limiter.Wait(req.Context()); err != nil {
 			return nil, err
 		}
 	}
 
-	// -------------------------------------------------
-	// Buffer request body (if any) – respects maxBufferSize
-	// -------------------------------------------------
-	bodyBytes, err := bufferRequestBody(req, t.client.maxBufferSize)
-	if err != nil {
-		return nil, err
+	// ----- retry loop -----
+	var (
+		resp    *http.Response
+		err     error
+		attempt int
+	)
+
+	for {
+		// Clone the request for each retry (important for bodies that implement io.ReadSeeker).
+		clonedReq := cloneRequest(req)
+
+		resp, err = t.transport.RoundTrip(clonedReq)
+
+		// Non‑retryable network error → bail out.
+		if err != nil && !t.client.retryable(resp, err) {
+			recordFailure(t.client, clonedReq, 0)
+			return nil, err
+		}
+
+		// Retryable response? (status code or error) and we still have attempts left.
+		if resp != nil && t.client.retryable(resp, err) && attempt < t.client.maxRetries {
+			// Compute back‑off for the next attempt.
+			backoff := t.client.minBackoff
+			if attempt > 0 {
+				backoff = time.Duration(float64(t.client.minBackoff) *
+					math.Pow(t.client.backoffFactor, float64(attempt)))
+			}
+			if backoff > t.client.maxBackoff {
+				backoff = t.client.maxBackoff
+			}
+
+			// Discard and close the body of the failed response before retrying.
+			if resp.Body != nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+
+			time.Sleep(backoff)
+			attempt++
+			continue
+		}
+		// Either success or we have exhausted retries.
+		break
 	}
 
-	var resp *http.Response
-	var retryAfter time.Duration
+	// ----- post‑response handling -----
+	if resp != nil {
+		// Adjust rate limiter based on response headers (if enabled).
+		if t.client.dynamicRateAdjustment {
+			t.client.adjustRateLimiter(resp)
+		}
 
-	// -------------------------------------------------
-	// Retry loop
-	// -------------------------------------------------
-	for attempt := 0; attempt <= t.client.maxRetries; attempt++ {
-		if attempt > 0 {
-			// Restore the body for the next attempt.
-			if bodyBytes != nil {
-				req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		// ----- circuit‑breaker outcome -----
+		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+			// Successful response – record success.
+			if t.client.circuitBreaker != nil {
+				t.client.circuitBreaker.RecordSuccess()
 			}
-			wait := t.client.calculateBackoff(attempt-1, retryAfter)
-			logInfo(t.client.logger, "retrying", requestID,
-				golog.Duration("wait", wait), golog.Int("attempt", attempt))
-
-			if t.client.metrics != nil {
-				t.client.metrics.IncRetries(req.Method, req.URL.String(), attempt)
-			}
-
-			select {
-			case <-time.After(wait):
-			case <-req.Context().Done():
-				recordFailure(t.client, req, 0)
-				return nil, fmt.Errorf("context: %w", req.Context().Err())
-			}
-		}
-
-		// Perform the actual request.
-		resp, err = t.transport.RoundTrip(req)
-		if err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
-			recordFailure(t.client, req, 0)
-			return nil, fmt.Errorf("transport: %w", err)
-		}
-
-		// Capture any Retry‑After header before we possibly discard the response.
-		retryAfter = parseRetryAfter(resp)
-
-		// Decide whether we should retry.
-		if !t.client.retryable(resp, err) {
-			break
-		}
-
-		// Drain and close the body before the next attempt.
-		if resp != nil && resp.Body != nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-		}
-	}
-
-	// -------------------------------------------------
-	// Dynamic rate‑limit adjustment (optional)
-	// -------------------------------------------------
-	if t.client.dynamicRateAdjustment && t.client.limiter != nil && resp != nil {
-		t.client.adjustRateLimiter(resp)
-	}
-
-	// -------------------------------------------------
-	// Optional response validation
-	// -------------------------------------------------
-	if t.client.validateResponse != nil && resp != nil {
-		if vErr := t.client.validateResponse(resp); vErr != nil {
-			logError(t.client.logger, "response validation failed", vErr, requestID)
+			// No failure to record here.
+		} else {
+			// Failure – delegate to the shared helper (records both metrics and CB state).
 			recordFailure(t.client, req, resp.StatusCode)
-			return nil, fmt.Errorf("response validation: %w", vErr)
+		}
+
+		// ----- Preserve the response body for callers -----
+		if resp.Body != nil {
+			bodyBytes, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close() // close the original network stream
+			if readErr != nil {
+				return nil, readErr
+			}
+			// Replace with a fresh, reusable ReadCloser.
+			resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
 	}
 
-	// -------------------------------------------------
-	// Record success/failure and metrics
-	// -------------------------------------------------
-	if err != nil || (resp != nil && resp.StatusCode >= 400) {
-		recordFailure(t.client, req, respStatusCode(resp))
-	} else {
-		recordSuccess(t.client)
-	}
-
+	// ----- metrics: latency -----
 	if t.client.metrics != nil {
-		t.client.metrics.ObserveLatency(req.Method, req.URL.String(), time.Since(start))
+		latency := time.Since(start)
+		t.client.metrics.ObserveLatency(req.Method, req.URL.String(), latency)
 	}
-
-	return resp, err
+	return resp, nil
 }
 
 // -----------------------------------------------------------------------------
@@ -454,28 +474,35 @@ func (c *Client) adjustRateLimiter(resp *http.Response) {
 
 // Do sends an HTTP request, injecting request‑ID, idempotency key and default headers.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
+	// -------------------------------------------------------------------------
+	// 1️⃣  Inject a request‑ID (already present in the original code)
+	// -------------------------------------------------------------------------
 	requestID := uuid.New().String()
 	ctx := context.WithValue(req.Context(), requestIDKey, requestID)
 	req = req.WithContext(ctx)
 
-	// Idempotency key handling.
-	if c.idempotencyMethods[req.Method] && req.Header.Get("Idempotency-Key") == "" {
-		req.Header.Set("Idempotency-Key", requestID)
-	}
-
-	// Apply default headers where the caller hasn't set them.
-	for k, v := range c.defaultHeaders {
-		if req.Header.Get(k) == "" {
-			req.Header.Set(k, v)
+	// -------------------------------------------------------------------------
+	// 2️⃣  Add Idempotency‑Key header when the method is configured as idempotent
+	// -------------------------------------------------------------------------
+	if c.idempotencyMethods != nil && c.idempotencyMethods[req.Method] {
+		// Only set the header if the caller hasn’t supplied one already.
+		if req.Header.Get("Idempotency-Key") == "" {
+			req.Header.Set("Idempotency-Key", uuid.New().String())
 		}
 	}
 
-	if c.logger != nil {
-		c.logger.Debug("sending request",
-			golog.String("method", req.Method),
-			golog.String("url", req.URL.String()),
-			golog.String("requestID", requestID))
+	// -------------------------------------------------------------------------
+	// 3️⃣  Enforce the maximum request‑body size
+	// -------------------------------------------------------------------------
+	// bufferRequestBody reads up to c.maxBufferSize bytes and returns an error
+	// if the body is larger.  It also rewinds the body so the transport can read it.
+	if _, err := bufferRequestBody(req, c.maxBufferSize); err != nil {
+		return nil, err
 	}
+
+	// -------------------------------------------------------------------------
+	// 4️⃣  Finally forward the request to the underlying http.Client
+	// -------------------------------------------------------------------------
 	return c.client.Do(req)
 }
 
@@ -488,28 +515,38 @@ func (c *Client) applyTimeout(parent context.Context, timeout time.Duration) (co
 	return parent, func() {}
 }
 
-// Get performs a GET request and optionally decodes JSON into out.
+// Get performs a GET request and optionally decodes a JSON response into out.
 func (c *Client) Get(ctx context.Context, url string, timeout time.Duration, out interface{}) (*http.Response, error) {
+	// -------------------------------------------------------------------------
+	// 1️⃣  Apply a per‑call timeout (if the caller asked for one)
+	// -------------------------------------------------------------------------
 	ctx, cancel := c.applyTimeout(ctx, timeout)
 	defer cancel()
 
+	// -------------------------------------------------------------------------
+	// 2️⃣  Build the GET request
+	// -------------------------------------------------------------------------
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
 	}
+
+	// -------------------------------------------------------------------------
+	// 3️⃣  Execute the request via the client (retries, circuit‑breaker, etc.)
+	// -------------------------------------------------------------------------
 	resp, err := c.Do(req)
 	if err != nil {
+		// Strip the “METHOD \"URL\": ” prefix that the retry transport may add.
 		return nil, stripMethodURLPrefix(err)
 	}
+
+	// -------------------------------------------------------------------------
+	// 4️⃣  Decode JSON into out (if the caller supplied a destination)
+	// -------------------------------------------------------------------------
 	if out != nil {
-		// Read the full body first – this guarantees the decoder sees the data
-		// even if the underlying transport performed any internal draining.
-		data, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			return resp, fmt.Errorf("reading response: %w", readErr)
-		}
-		if decErr := json.Unmarshal(data, out); decErr != nil {
+		// Ensure the body gets closed after decoding.
+		defer resp.Body.Close()
+		if decErr := json.NewDecoder(resp.Body).Decode(out); decErr != nil {
 			return resp, fmt.Errorf("unmarshalling response: %w", decErr)
 		}
 	}
@@ -530,13 +567,9 @@ func (c *Client) Post(ctx context.Context, url string, body io.Reader, timeout t
 		return nil, stripMethodURLPrefix(err)
 	}
 	if out != nil {
-		data, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			return resp, fmt.Errorf("reading response: %w", readErr)
-		}
-		if decErr := json.Unmarshal(data, out); decErr != nil {
-			return resp, fmt.Errorf("unmarshalling response: %w", decErr)
+		defer resp.Body.Close()
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			return resp, fmt.Errorf("unmarshalling response: %w", err)
 		}
 	}
 	return resp, nil
@@ -556,13 +589,9 @@ func (c *Client) Put(ctx context.Context, url string, body io.Reader, timeout ti
 		return nil, stripMethodURLPrefix(err)
 	}
 	if out != nil {
-		data, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			return resp, fmt.Errorf("reading response: %w", readErr)
-		}
-		if decErr := json.Unmarshal(data, out); decErr != nil {
-			return resp, fmt.Errorf("unmarshalling response: %w", decErr)
+		defer resp.Body.Close()
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			return resp, fmt.Errorf("unmarshalling response: %w", err)
 		}
 	}
 	return resp, nil
@@ -582,13 +611,9 @@ func (c *Client) Delete(ctx context.Context, url string, timeout time.Duration, 
 		return nil, stripMethodURLPrefix(err)
 	}
 	if out != nil {
-		data, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			return resp, fmt.Errorf("reading response: %w", readErr)
-		}
-		if decErr := json.Unmarshal(data, out); decErr != nil {
-			return resp, fmt.Errorf("unmarshalling response: %w", decErr)
+		defer resp.Body.Close()
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+			return resp, fmt.Errorf("unmarshalling response: %w", err)
 		}
 	}
 	return resp, nil
