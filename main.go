@@ -502,9 +502,15 @@ func (c *Client) Get(ctx context.Context, url string, timeout time.Duration, out
 		return nil, stripMethodURLPrefix(err)
 	}
 	if out != nil {
-		defer resp.Body.Close()
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-			return resp, fmt.Errorf("unmarshalling response: %w", err)
+		// Read the full body first – this guarantees the decoder sees the data
+		// even if the underlying transport performed any internal draining.
+		data, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return resp, fmt.Errorf("reading response: %w", readErr)
+		}
+		if decErr := json.Unmarshal(data, out); decErr != nil {
+			return resp, fmt.Errorf("unmarshalling response: %w", decErr)
 		}
 	}
 	return resp, nil
@@ -524,9 +530,13 @@ func (c *Client) Post(ctx context.Context, url string, body io.Reader, timeout t
 		return nil, stripMethodURLPrefix(err)
 	}
 	if out != nil {
-		defer resp.Body.Close()
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-			return resp, fmt.Errorf("unmarshalling response: %w", err)
+		data, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return resp, fmt.Errorf("reading response: %w", readErr)
+		}
+		if decErr := json.Unmarshal(data, out); decErr != nil {
+			return resp, fmt.Errorf("unmarshalling response: %w", decErr)
 		}
 	}
 	return resp, nil
@@ -546,9 +556,13 @@ func (c *Client) Put(ctx context.Context, url string, body io.Reader, timeout ti
 		return nil, stripMethodURLPrefix(err)
 	}
 	if out != nil {
-		defer resp.Body.Close()
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-			return resp, fmt.Errorf("unmarshalling response: %w", err)
+		data, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return resp, fmt.Errorf("reading response: %w", readErr)
+		}
+		if decErr := json.Unmarshal(data, out); decErr != nil {
+			return resp, fmt.Errorf("unmarshalling response: %w", decErr)
 		}
 	}
 	return resp, nil
@@ -568,9 +582,13 @@ func (c *Client) Delete(ctx context.Context, url string, timeout time.Duration, 
 		return nil, stripMethodURLPrefix(err)
 	}
 	if out != nil {
-		defer resp.Body.Close()
-		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-			return resp, fmt.Errorf("unmarshalling response: %w", err)
+		data, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return resp, fmt.Errorf("reading response: %w", readErr)
+		}
+		if decErr := json.Unmarshal(data, out); decErr != nil {
+			return resp, fmt.Errorf("unmarshalling response: %w", decErr)
 		}
 	}
 	return resp, nil
