@@ -216,8 +216,10 @@ type retryTransport struct {
 // back‑off handling and response‑body preservation.
 func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	/* --------------------------------------------------------------
-	   0️⃣ Preserve the last‑successful response body so the caller can
-	      read it after the retry loop finishes.
+	   0️⃣ Preserve the last‑successful response body only when we
+	      need to retry (i.e. on transient failures).  For a successful
+	      response we return it untouched so the caller can read the
+	      original body directly.
 	   -------------------------------------------------------------- */
 	var lastBody []byte
 
@@ -241,7 +243,7 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		/* -------------------- circuit‑breaker -------------------- */
 		if t.client.circuitBreaker != nil {
 			if cbErr := t.client.circuitBreaker.Allow(); cbErr != nil {
-				// Expected error text: “circuit breaker: circuit open”
+				// Expected string: “circuit breaker: circuit open”
 				return nil, fmt.Errorf("circuit breaker: %s", cbErr.Error())
 			}
 		}
@@ -256,22 +258,6 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		/* ---------------------- request -------------------------- */
 		resp, err = t.transport.RoundTrip(req)
 
-		/* ------------------- read & cache body ------------------- */
-		if resp != nil && resp.Body != nil {
-			bodyBytes, readErr := io.ReadAll(resp.Body)
-			if readErr != nil {
-				// treat read error as a failure that may trigger a retry
-				err = readErr
-			} else {
-				// keep the bytes for the final response we will return
-				lastBody = bodyBytes
-
-				// replace the drained body so a *future* retry can read it
-				resp.Body.Close()
-				resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			}
-		}
-
 		/* -------------------- retry decision -------------------- */
 		needRetry := false
 		if attempt < t.client.maxRetries {
@@ -281,27 +267,53 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 				needRetry = true
 			}
 		}
-		if !needRetry {
-			break // success or max retries reached
+
+		/* -------------------- handle transient failures --------- */
+		if needRetry {
+			/* We have to consume the body (if any) so that the next
+			   retry can reuse the connection.  We also keep a copy
+			   of the bytes in case this turn happens to be the last
+			   one (unlikely, but safe). */
+			if resp != nil && resp.Body != nil {
+				bodyBytes, readErr := io.ReadAll(resp.Body)
+				if readErr != nil {
+					// treat read error as a failure that may trigger another retry
+					err = readErr
+				} else {
+					lastBody = bodyBytes
+					// replace drained body so a subsequent retry can read it again
+					resp.Body.Close()
+					resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				}
+			}
+
+			/* -------------------- back‑off & sleep ------------------- */
+			var retryAfter time.Duration
+			if resp != nil {
+				retryAfter = parseRetryAfter(resp) // helper defined elsewhere
+			}
+			delay := t.client.calculateBackoff(attempt, retryAfter)
+
+			select {
+			case <-time.After(delay):
+				// continue to next attempt
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			}
+			// loop continues with the next attempt
+			continue
 		}
 
-		/* -------------------- back‑off & sleep ------------------- */
-		var retryAfter time.Duration
-		if resp != nil {
-			retryAfter = parseRetryAfter(resp) // helper defined elsewhere
-		}
-		delay := t.client.calculateBackoff(attempt, retryAfter)
-
-		select {
-		case <-time.After(delay):
-			// continue to next attempt
-		case <-req.Context().Done():
-			return nil, req.Context().Err()
-		}
+		/* -------------------- success path -------------------- */
+		// No more retries – exit the loop.
+		break
 	}
 
 	/* --------------------------------------------------------------
-	   4️⃣ Restore a readable body for the caller (if we have one).
+	   4️⃣ If we retried and ended up with a response whose body we
+	      already consumed, restore a fresh reader so the caller can
+	      decode the payload.  If we never retried (the common case),
+	      the original body is still intact and we leave it untouched.
 	   -------------------------------------------------------------- */
 	if resp != nil && resp.Body != nil && lastBody != nil {
 		resp.Body = io.NopCloser(bytes.NewReader(lastBody))
