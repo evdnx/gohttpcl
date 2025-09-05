@@ -216,14 +216,6 @@ type retryTransport struct {
 // back‑off handling and response‑body preservation.
 func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	/* --------------------------------------------------------------
-	   0️⃣ Preserve the last‑successful response body only when we
-	      need to retry (i.e. on transient failures).  For a successful
-	      response we return it untouched so the caller can read the
-	      original body directly.
-	   -------------------------------------------------------------- */
-	var lastBody []byte
-
-	/* --------------------------------------------------------------
 	   1️⃣ Record start time for latency metrics.
 	   -------------------------------------------------------------- */
 	start := time.Now()
@@ -243,7 +235,6 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		/* -------------------- circuit‑breaker -------------------- */
 		if t.client.circuitBreaker != nil {
 			if cbErr := t.client.circuitBreaker.Allow(); cbErr != nil {
-				// Expected string: “circuit breaker: circuit open”
 				return nil, fmt.Errorf("circuit breaker: %s", cbErr.Error())
 			}
 		}
@@ -256,7 +247,9 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 
 		/* ---------------------- request -------------------------- */
-		resp, err = t.transport.RoundTrip(req)
+		// Clone the request for retries to avoid modifying the original
+		reqToSend := cloneRequest(req)
+		resp, err = t.transport.RoundTrip(reqToSend)
 
 		/* -------------------- retry decision -------------------- */
 		needRetry := false
@@ -270,27 +263,23 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 		/* -------------------- handle transient failures --------- */
 		if needRetry {
-			/* We have to consume the body (if any) so that the next
-			   retry can reuse the connection.  We also keep a copy
-			   of the bytes in case this turn happens to be the last
-			   one (unlikely, but safe). */
 			if resp != nil && resp.Body != nil {
+				// Read the body to ensure it's preserved for the caller
 				bodyBytes, readErr := io.ReadAll(resp.Body)
+				resp.Body.Close()
 				if readErr != nil {
-					// treat read error as a failure that may trigger another retry
-					err = readErr
-				} else {
-					lastBody = bodyBytes
-					// replace drained body so a subsequent retry can read it again
-					resp.Body.Close()
-					resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+					// Propagate the read error – the caller will see it when the
+					// transport returns (resp will be nil in that case).
+					return nil, fmt.Errorf("reading final response body: %w", readErr)
 				}
+				// Replace the body with a fresh reader
+				resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 			}
 
 			/* -------------------- back‑off & sleep ------------------- */
 			var retryAfter time.Duration
 			if resp != nil {
-				retryAfter = parseRetryAfter(resp) // helper defined elsewhere
+				retryAfter = parseRetryAfter(resp)
 			}
 			delay := t.client.calculateBackoff(attempt, retryAfter)
 
@@ -310,13 +299,20 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	/* --------------------------------------------------------------
-	   4️⃣ If we retried and ended up with a response whose body we
-	      already consumed, restore a fresh reader so the caller can
-	      decode the payload.  If we never retried (the common case),
-	      the original body is still intact and we leave it untouched.
+	   4️⃣ Handle the final response body.
 	   -------------------------------------------------------------- */
-	if resp != nil && resp.Body != nil && lastBody != nil {
-		resp.Body = io.NopCloser(bytes.NewReader(lastBody))
+	if resp != nil && resp.Body != nil {
+		// Read the body to ensure it's preserved for the caller
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			if t.client.metrics != nil {
+				t.client.metrics.IncFailures(req.Method, req.URL.String(), 0)
+			}
+			return nil, fmt.Errorf("reading final response body: %w", readErr)
+		}
+		// Replace the body with a fresh reader
+		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
 
 	/* --------------------------------------------------------------
@@ -341,7 +337,7 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		t.client.metrics.ObserveLatency(req.Method, req.URL.String(), latency)
 	}
 
-	return resp, nil
+	return resp, err
 }
 
 // -----------------------------------------------------------------------------
@@ -552,47 +548,34 @@ func (c *Client) checkBodySize(body io.Reader) (io.Reader, error) {
 // Public API (Do, Get, Post, Put, Delete, etc.)
 // -----------------------------------------------------------------------------
 
-// Do sends an HTTP request, applying all middle‑wares (retries, circuit‑breaker,
-// rate‑limiting, idempotency‑key, etc.) that are wired into the client's
-// transport.  The response body is already buffered by the retryTransport,
-// so we do **not** read it again here.
+// Do sends an HTTP request, applying default headers, idempotency keys,
+// circuit‑breaker checks, rate‑limiting, and finally returns the response
+// with a reusable body.
 //
-// The caller (Get/Post/Put/Delete) is responsible for closing resp.Body
-// after it has been processed (e.g. JSON‑decoded).
+// All higher‑level helpers (`Get`, `Post`, `Put`, `Delete`) rely on this
+// method, so we make sure the body is not consumed here.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	// -----------------------------------------------------------------
-	// 1️⃣  Attach default headers (if any)
+	// 0️⃣ Apply default headers (if any)
 	// -----------------------------------------------------------------
 	for k, v := range c.defaultHeaders {
-		// Only set the header if the caller hasn't already provided it.
 		if req.Header.Get(k) == "" {
 			req.Header.Set(k, v)
 		}
 	}
 
 	// -----------------------------------------------------------------
-	// 2️⃣  Apply idempotency key when the request method matches the
-	//     configured list (WithIdempotencyMethods).  The client itself
-	//     implements the tiny helper `applyIdempotencyKey`.
+	// 1️⃣ Idempotency key handling (only for configured methods)
 	// -----------------------------------------------------------------
-	if applier, ok := interface{}(c).(interface {
-		applyIdempotencyKey(*http.Request)
-	}); ok {
-		applier.applyIdempotencyKey(req)
+	if c.idempotencyMethods[req.Method] {
+		if req.Header.Get("Idempotency-Key") == "" {
+			req.Header.Set("Idempotency-Key", getRequestID(req.Context()))
+		}
 	}
 
 	// -----------------------------------------------------------------
-	// 3️⃣  Run the request through the transport chain.
-	//
-	// The retryTransport (installed in New) performs:
-	//   • circuit‑breaker pre‑check,
-	//   • rate‑limiter wait,
-	//   • retry loop with exponential back‑off,
-	//   • buffering of the response body so that resp.Body is a fresh
-	//     NopCloser containing the full payload.
-	//
-	// Because of that, we **must not** read the body again here – doing so
-	// would consume the data and leave the caller with an empty body.
+	// 2️⃣ Execute the underlying http.Client request (the heavy lifting
+	//    – retries, rate‑limit, circuit‑breaker – lives in the transport).
 	// -----------------------------------------------------------------
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -600,19 +583,35 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	}
 
 	// -----------------------------------------------------------------
-	// 4️⃣  Optional response validation (user‑supplied hook).
+	// 3️⃣ Preserve the response body for the caller.
+	//
+	// The transport already buffered the body, but callers may also invoke
+	// `Do` directly (bypassing the transport’s RoundTrip).  To be safe we
+	// always read‑and‑restore the body here.
 	// -----------------------------------------------------------------
-	if c.validateResponse != nil {
-		if vErr := c.validateResponse(resp); vErr != nil {
-			// Ensure the body is closed before bubbling the error up.
-			resp.Body.Close()
-			return resp, vErr
+	if resp.Body != nil {
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("buffering response body: %w", readErr)
 		}
+		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	}
 
 	// -----------------------------------------------------------------
-	// 5️⃣  Return the response untouched – the caller will decode/close it.
+	// 4️⃣ Optional logging / metrics can be added here without touching
+	//    the body again.
 	// -----------------------------------------------------------------
+	if c.logger != nil {
+		logInfo(c.logger, "request completed", getRequestID(req.Context()),
+			golog.String("method", req.Method),
+			golog.String("url", req.URL.String()),
+			golog.Int("status", resp.StatusCode))
+	}
+	if c.metrics != nil {
+		c.metrics.IncRequests(req.Method, req.URL.String())
+	}
+
 	return resp, nil
 }
 
@@ -639,9 +638,8 @@ func (c *Client) applyTimeout(parent context.Context, timeout time.Duration) (co
 	return parent, func() {}
 }
 
-// ---------------------------------------------------------------------
-// Get – perform a GET request and optionally decode a JSON payload.
-// ---------------------------------------------------------------------
+// Get performs an HTTP GET request, optionally unmarshalling a JSON response
+// into the provided out value.  The caller must close resp.Body when finished.
 func (c *Client) Get(
 	ctx context.Context,
 	url string,
@@ -649,30 +647,35 @@ func (c *Client) Get(
 	out interface{},
 ) (*http.Response, error) {
 
-	ctx, cancel := c.applyTimeout(ctx, timeout)
-	defer cancel()
-
+	// 1️⃣ Build request
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+		return nil, err
 	}
 
-	// Use the high‑level client so all middleware (retries, circuit‑breaker,
-	// rate‑limiter, idempotency‑key) runs.
+	// 2️⃣ Apply per‑request timeout (if any)
+	ctx, cancel := c.applyTimeout(req.Context(), timeout)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	// 3️⃣ Send request through the client (retries, rate‑limit, etc.)
 	resp, err := c.Do(req)
 	if err != nil {
-		return nil, stripMethodURLPrefix(err)
+		return nil, err
 	}
 
-	if dErr := readAndDecode(resp, out); dErr != nil {
-		return resp, dErr
+	// 4️⃣ Decode JSON payload (if caller supplied a destination)
+	if out != nil && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		if decErr := json.NewDecoder(resp.Body).Decode(out); decErr != nil && decErr != io.EOF {
+			return resp, fmt.Errorf("decoding response: %w", decErr)
+		}
 	}
+	// Caller is responsible for closing resp.Body.
 	return resp, nil
 }
 
-// ---------------------------------------------------------------------
-// Post – perform a POST request with an optional body and JSON decode.
-// ---------------------------------------------------------------------
+// Post performs an HTTP POST request with the given body, optionally
+// unmarshalling a JSON response into out.  The caller must close resp.Body.
 func (c *Client) Post(
 	ctx context.Context,
 	url string,
@@ -681,33 +684,34 @@ func (c *Client) Post(
 	out interface{},
 ) (*http.Response, error) {
 
-	ctx, cancel := c.applyTimeout(ctx, timeout)
-	defer cancel()
-
-	validBody, err := c.checkBodySize(body)
+	// 1️⃣ Build request
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, validBody)
-	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
-	}
+	// 2️⃣ Apply per‑request timeout (if any)
+	ctx, cancel := c.applyTimeout(req.Context(), timeout)
+	defer cancel()
+	req = req.WithContext(ctx)
 
+	// 3️⃣ Send request
 	resp, err := c.Do(req)
 	if err != nil {
-		return nil, stripMethodURLPrefix(err)
+		return nil, err
 	}
 
-	if dErr := readAndDecode(resp, out); dErr != nil {
-		return resp, dErr
+	// 4️⃣ Decode JSON payload
+	if out != nil && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		if decErr := json.NewDecoder(resp.Body).Decode(out); decErr != nil && decErr != io.EOF {
+			return resp, fmt.Errorf("decoding response: %w", decErr)
+		}
 	}
 	return resp, nil
 }
 
-// ---------------------------------------------------------------------
-// Put – perform a PUT request with an optional body and JSON decode.
-// ---------------------------------------------------------------------
+// Put performs an HTTP PUT request with the given body, optionally
+// unmarshalling a JSON response into out.  The caller must close resp.Body.
 func (c *Client) Put(
 	ctx context.Context,
 	url string,
@@ -716,33 +720,34 @@ func (c *Client) Put(
 	out interface{},
 ) (*http.Response, error) {
 
-	ctx, cancel := c.applyTimeout(ctx, timeout)
-	defer cancel()
-
-	validBody, err := c.checkBodySize(body)
+	// 1️⃣ Build request
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, body)
 	if err != nil {
 		return nil, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, validBody)
-	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
-	}
+	// 2️⃣ Apply per‑request timeout (if any)
+	ctx, cancel := c.applyTimeout(req.Context(), timeout)
+	defer cancel()
+	req = req.WithContext(ctx)
 
+	// 3️⃣ Send request
 	resp, err := c.Do(req)
 	if err != nil {
-		return nil, stripMethodURLPrefix(err)
+		return nil, err
 	}
 
-	if dErr := readAndDecode(resp, out); dErr != nil {
-		return resp, dErr
+	// 4️⃣ Decode JSON payload
+	if out != nil && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		if decErr := json.NewDecoder(resp.Body).Decode(out); decErr != nil && decErr != io.EOF {
+			return resp, fmt.Errorf("decoding response: %w", decErr)
+		}
 	}
 	return resp, nil
 }
 
-// ---------------------------------------------------------------------
-// Delete – perform a DELETE request and optionally decode a JSON payload.
-// ---------------------------------------------------------------------
+// Delete performs an HTTP DELETE request, optionally unmarshalling a JSON
+// response into out.  The caller must close resp.Body.
 func (c *Client) Delete(
 	ctx context.Context,
 	url string,
@@ -750,21 +755,28 @@ func (c *Client) Delete(
 	out interface{},
 ) (*http.Response, error) {
 
-	ctx, cancel := c.applyTimeout(ctx, timeout)
-	defer cancel()
-
+	// 1️⃣ Build request (no body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+		return nil, err
 	}
 
+	// 2️⃣ Apply per‑request timeout (if any)
+	ctx, cancel := c.applyTimeout(req.Context(), timeout)
+	defer cancel()
+	req = req.WithContext(ctx)
+
+	// 3️⃣ Send request
 	resp, err := c.Do(req)
 	if err != nil {
-		return nil, stripMethodURLPrefix(err)
+		return nil, err
 	}
 
-	if dErr := readAndDecode(resp, out); dErr != nil {
-		return resp, dErr
+	// 4️⃣ Decode JSON payload
+	if out != nil && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		if decErr := json.NewDecoder(resp.Body).Decode(out); decErr != nil && decErr != io.EOF {
+			return resp, fmt.Errorf("decoding response: %w", decErr)
+		}
 	}
 	return resp, nil
 }

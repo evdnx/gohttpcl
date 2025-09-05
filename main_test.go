@@ -99,13 +99,16 @@ func TestRetryOnTransientError(t *testing.T) {
 			w.WriteHeader(http.StatusBadGateway) // 502
 			return
 		}
+		w.Header().Set("Content-Type", "application/json") // Add Content-Type
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"msg":"ok"}`))
 	})
 	defer ts.Close()
 
 	c := New(WithMaxRetries(3))
-	var out struct{ Msg string }
+	var out struct {
+		Msg string `json:"msg"` // JSON tag already added
+	}
 	_, err := c.Get(context.Background(), ts.URL(), 0, &out)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
