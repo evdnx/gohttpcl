@@ -846,7 +846,7 @@ func (cb *CircuitBreaker) Allow() error {
 			cb.state = stateHalfOpen
 			return nil
 		}
-		return errors.New("circuit open")
+		return errors.New("circuit breaker: circuit open")
 	case stateHalfOpen, stateClosed:
 		return nil
 	}

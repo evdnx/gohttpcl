@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -153,7 +154,7 @@ func TestCircuitBreakerOpensAfterThreshold(t *testing.T) {
 
 	// Third request → should be blocked by the open circuit
 	_, err := c.Get(context.Background(), ts.URL(), 0, nil)
-	if err == nil || err.Error() != "circuit breaker: circuit open" {
+	if err == nil || !strings.Contains(err.Error(), "circuit breaker: circuit open") {
 		t.Fatalf("expected circuit‑open error, got %v", err)
 	}
 }
