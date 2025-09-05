@@ -14,6 +14,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	neturl "net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -687,12 +688,14 @@ func (c *Client) Get(
 	// 3️⃣ Send request through the client (retries, rate‑limit, etc.)
 	resp, err := c.Do(req)
 	if err != nil {
+		// Unwrap possible *url.Error to expose the original cause.
+		if ue, ok := err.(*neturl.Error); ok {
+			err = ue.Err
+		}
 		return nil, err
 	}
 
 	// 4️⃣ Decode JSON payload (if a destination was supplied)
-	// readAndDecode reads the body, unmarshals JSON (when out != nil),
-	// closes the original body and replaces it with a fresh reader.
 	if err = readAndDecode(resp, out); err != nil {
 		return resp, err
 	}
@@ -723,6 +726,10 @@ func (c *Client) Post(
 	// 3️⃣ Send request
 	resp, err := c.Do(req)
 	if err != nil {
+		// Unwrap possible *url.Error to expose the original cause.
+		if ue, ok := err.(*neturl.Error); ok {
+			err = ue.Err
+		}
 		return nil, err
 	}
 
@@ -759,6 +766,10 @@ func (c *Client) Put(
 	// 3️⃣ Send request
 	resp, err := c.Do(req)
 	if err != nil {
+		// Unwrap possible *url.Error to expose the original cause.
+		if ue, ok := err.(*neturl.Error); ok {
+			err = ue.Err
+		}
 		return nil, err
 	}
 
@@ -794,6 +805,10 @@ func (c *Client) Delete(
 	// 3️⃣ Send request
 	resp, err := c.Do(req)
 	if err != nil {
+		// Unwrap possible *url.Error to expose the original cause.
+		if ue, ok := err.(*neturl.Error); ok {
+			err = ue.Err
+		}
 		return nil, err
 	}
 
