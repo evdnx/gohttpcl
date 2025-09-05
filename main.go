@@ -211,132 +211,169 @@ type retryTransport struct {
 	client    *Client
 }
 
-// RoundTrip implements http.RoundTripper.
-// It adds metrics, circuit‑breaker checks, rate‑limiting, retries,
-// back‑off handling and response‑body preservation.
-func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	/* --------------------------------------------------------------
-	   1️⃣ Record start time for latency metrics.
-	   -------------------------------------------------------------- */
-	start := time.Now()
+// RoundTrip executes a single HTTP transaction, applying the client’s
+// retry, circuit‑breaker, rate‑limiting and metric logic.
+func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	c := rt.client
 
-	/* --------------------------------------------------------------
-	   2️⃣ Variables that survive the loop.
-	   -------------------------------------------------------------- */
+	// -----------------------------------------------------------------
+	// 0️⃣  Circuit‑breaker pre‑check – reject request early if the CB is open.
+	// -----------------------------------------------------------------
+	if c.circuitBreaker != nil {
+		if err := c.circuitBreaker.Allow(); err != nil {
+			return nil, err // “circuit open”
+		}
+	}
+
+	// -----------------------------------------------------------------
+	// 1️⃣  Rate‑limiting – wait for a token before proceeding.
+	// -----------------------------------------------------------------
+	if c.limiter != nil {
+		if err := c.limiter.Wait(req.Context()); err != nil {
+			return nil, err
+		}
+	}
+
+	// -----------------------------------------------------------------
+	// 2️⃣  Prepare the request body for possible retries.
+	//
+	//     • If a max‑buffer size is configured we verify the body does not
+	//       exceed it (and obtain a rewindable reader when possible).
+	//     • The body is also buffered so that retries can resend the exact
+	//       same payload.
+	// -----------------------------------------------------------------
+	var bodyCopy io.ReadSeeker
+	if req.Body != nil && c.maxBufferSize > 0 {
+		// Check size & obtain a seekable copy.
+		b, err := bufferRequestBody(req, c.maxBufferSize)
+		if err != nil {
+			return nil, err
+		}
+		// Keep a copy for retries.
+		bodyCopy = bytes.NewReader(b)
+		// Reset the request body for the first attempt.
+		req.Body = io.NopCloser(bytes.NewReader(b))
+	}
+
+	// -----------------------------------------------------------------
+	// 3️⃣  Execute the request with retry logic.
+	// -----------------------------------------------------------------
 	var (
-		resp *http.Response
-		err  error
+		resp       *http.Response
+		err        error
+		attempt    int
+		start      = time.Now()
+		retryAfter time.Duration
 	)
 
-	/* --------------------------------------------------------------
-	   3️⃣ Main retry loop.
-	   -------------------------------------------------------------- */
-	for attempt := 0; ; attempt++ {
-		/* -------------------- circuit‑breaker -------------------- */
-		if t.client.circuitBreaker != nil {
-			if cbErr := t.client.circuitBreaker.Allow(); cbErr != nil {
-				return nil, fmt.Errorf("circuit breaker: %s", cbErr.Error())
+	for {
+		// If we have a buffered body, rewind it before each attempt.
+		if bodyCopy != nil {
+			if _, err = bodyCopy.Seek(0, io.SeekStart); err != nil {
+				return nil, fmt.Errorf("rewinding request body: %w", err)
 			}
+			req.Body = io.NopCloser(bodyCopy)
 		}
 
-		/* ---------------------- rate‑limit ---------------------- */
-		if t.client.limiter != nil {
-			if limErr := t.client.limiter.Wait(req.Context()); limErr != nil {
-				return nil, limErr
-			}
-		}
+		// Perform the actual HTTP request.
+		resp, err = rt.transport.RoundTrip(req)
 
-		/* ---------------------- request -------------------------- */
-		// Clone the request for retries to avoid modifying the original
-		reqToSend := cloneRequest(req)
-		resp, err = t.transport.RoundTrip(reqToSend)
-
-		/* -------------------- retry decision -------------------- */
-		needRetry := false
-		if attempt < t.client.maxRetries {
-			if err != nil && t.client.retryable(resp, err) {
-				needRetry = true
-			} else if err == nil && resp != nil && t.client.retryable(resp, nil) {
-				needRetry = true
-			}
-		}
-
-		/* -------------------- handle transient failures --------- */
-		if needRetry {
-			if resp != nil && resp.Body != nil {
-				// Read the body to ensure it's preserved for the caller
-				bodyBytes, readErr := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				if readErr != nil {
-					// Propagate the read error – the caller will see it when the
-					// transport returns (resp will be nil in that case).
-					return nil, fmt.Errorf("reading final response body: %w", readErr)
-				}
-				// Replace the body with a fresh reader
-				resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			}
-
-			/* -------------------- back‑off & sleep ------------------- */
-			var retryAfter time.Duration
-			if resp != nil {
+		// -----------------------------------------------------------------
+		// 3a️⃣  Determine whether we should retry.
+		// -----------------------------------------------------------------
+		shouldRetry := false
+		if err != nil {
+			// Transport‑level error (e.g., network failure).
+			shouldRetry = c.retryable(nil, err)
+		} else {
+			// HTTP response received – consult retry predicate.
+			shouldRetry = c.retryable(resp, nil)
+			// Respect “Retry‑After” header for 429/503 etc.
+			if shouldRetry && resp != nil {
 				retryAfter = parseRetryAfter(resp)
 			}
-			delay := t.client.calculateBackoff(attempt, retryAfter)
-
-			select {
-			case <-time.After(delay):
-				// continue to next attempt
-			case <-req.Context().Done():
-				return nil, req.Context().Err()
-			}
-			// loop continues with the next attempt
-			continue
 		}
 
-		/* -------------------- success path -------------------- */
-		// No more retries – exit the loop.
-		break
-	}
-
-	/* --------------------------------------------------------------
-	   4️⃣ Handle the final response body.
-	   -------------------------------------------------------------- */
-	if resp != nil && resp.Body != nil {
-		// Read the body to ensure it's preserved for the caller
-		bodyBytes, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			if t.client.metrics != nil {
-				t.client.metrics.IncFailures(req.Method, req.URL.String(), 0)
-			}
-			return nil, fmt.Errorf("reading final response body: %w", readErr)
+		// -----------------------------------------------------------------
+		// 3b️⃣  Exit loop if no retry is needed or max attempts exceeded.
+		// -----------------------------------------------------------------
+		if !shouldRetry || attempt >= c.maxRetries {
+			break
 		}
-		// Replace the body with a fresh reader
-		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		attempt++
+
+		// -----------------------------------------------------------------
+		// 3c️⃣  Back‑off before the next attempt.
+		// -----------------------------------------------------------------
+		backoff := c.calculateBackoff(attempt, retryAfter)
+		select {
+		case <-time.After(backoff):
+			// continue to next attempt
+		case <-req.Context().Done():
+			// request cancelled / timed‑out while waiting
+			return nil, req.Context().Err()
+		}
 	}
 
-	/* --------------------------------------------------------------
-	   5️⃣ Post‑response housekeeping (dynamic rate‑adjustment,
-	      circuit‑breaker state updates, metrics, etc.).
-	   -------------------------------------------------------------- */
+	// -----------------------------------------------------------------
+	// 4️⃣  Post‑response housekeeping – this block **must run
+	//     unconditionally** because it restores the response body for the
+	//     caller and updates rate‑limit / circuit‑breaker state.
+	// -----------------------------------------------------------------
 	if resp != nil {
-		if t.client.dynamicRateAdjustment {
-			t.client.adjustRateLimiter(resp)
+		// -------------------------------------------------------------
+		// 4a️⃣ Preserve the body for the caller.
+		//
+		// The transport may have already consumed the body (e.g. when
+		// retries were performed). We read the entire payload, close the
+		// original body, and replace it with a fresh NopCloser backed by a
+		// byte slice so that the caller can read it exactly once.
+		// -------------------------------------------------------------
+		if resp.Body != nil {
+			bodyBytes, readErr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr != nil {
+				// Record the failure (if metrics are enabled) and surface the error.
+				if c.metrics != nil {
+					c.metrics.IncFailures(req.Method, req.URL.String(), 0)
+				}
+				return nil, fmt.Errorf("reading final response body: %w", readErr)
+			}
+			resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
-		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-			if t.client.circuitBreaker != nil {
-				t.client.circuitBreaker.RecordSuccess()
+
+		// -------------------------------------------------------------
+		// 4b️⃣ Dynamic rate‑limit adjustment (if enabled).
+		// -------------------------------------------------------------
+		if c.dynamicRateAdjustment {
+			c.adjustRateLimiter(resp)
+		}
+
+		// -------------------------------------------------------------
+		// 4c️⃣ Circuit‑breaker state update.
+		// -------------------------------------------------------------
+		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+			if c.circuitBreaker != nil {
+				c.circuitBreaker.RecordSuccess()
 			}
 		} else {
-			recordFailure(t.client, req, resp.StatusCode)
+			recordFailure(c, req, resp.StatusCode)
 		}
 	}
 
-	if t.client.metrics != nil {
+	// -----------------------------------------------------------------
+	// 5️⃣  Metrics collection – this is optional and now runs **after**
+	//     the body has been restored, so the caller always receives a
+	//     readable response.
+	// -----------------------------------------------------------------
+	if c.metrics != nil {
 		latency := time.Since(start)
-		t.client.metrics.ObserveLatency(req.Method, req.URL.String(), latency)
+		c.metrics.ObserveLatency(req.Method, req.URL.String(), latency)
 	}
 
+	// -----------------------------------------------------------------
+	// 6️⃣  Return the (potentially retried) response and any error.
+	// -----------------------------------------------------------------
 	return resp, err
 }
 
