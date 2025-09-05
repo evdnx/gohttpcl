@@ -222,16 +222,16 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	c := rt.client
 
 	// -----------------------------------------------------------------
-	// 0️⃣ Circuit‑breaker pre‑check – fail fast if the circuit is open.
+	// 0️⃣  Circuit‑breaker pre‑check – reject request early if the CB is open.
 	// -----------------------------------------------------------------
 	if c.circuitBreaker != nil {
 		if err := c.circuitBreaker.Allow(); err != nil {
-			return nil, err
+			return nil, err // “circuit open”
 		}
 	}
 
 	// -----------------------------------------------------------------
-	// 1️⃣ Rate‑limit – wait for a token if a limiter is configured.
+	// 1️⃣  Rate‑limiting – wait for a token before proceeding.
 	// -----------------------------------------------------------------
 	if c.limiter != nil {
 		if err := c.limiter.Wait(req.Context()); err != nil {
@@ -239,115 +239,147 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 
-	var lastErr error
+	// -----------------------------------------------------------------
+	// 2️⃣  Prepare the request body for possible retries.
+	//
+	//     • If a max‑buffer size is configured we verify the body does not
+	//       exceed it (and obtain a rewindable reader when possible).
+	//     • The body is also buffered so that retries can resend the exact
+	//       same payload.
+	// -----------------------------------------------------------------
+	var bodyCopy io.ReadSeeker
+	if req.Body != nil && c.maxBufferSize > 0 {
+		// Check size & obtain a seekable copy.
+		b, err := bufferRequestBody(req, c.maxBufferSize)
+		if err != nil {
+			return nil, err
+		}
+		// Keep a copy for retries.
+		bodyCopy = bytes.NewReader(b)
+		// Reset the request body for the first attempt.
+		req.Body = io.NopCloser(bytes.NewReader(b))
+	}
 
-	// --------------------------------------------------------------
-	// NOTE: `maxRetries` now represents the **total number of attempts**
-	// (the original library’s behaviour). The loop therefore runs
-	// `attempt < c.maxRetries`.
-	// --------------------------------------------------------------
-	for attempt := 0; attempt < c.maxRetries; attempt++ {
-		// Clone the request for each attempt (important for body reuse).
-		curReq := cloneRequest(req)
+	// -----------------------------------------------------------------
+	// 3️⃣  Execute the request with retry logic.
+	// -----------------------------------------------------------------
+	var (
+		resp       *http.Response
+		err        error
+		attempt    int
+		start      = time.Now()
+		retryAfter time.Duration
+	)
+
+	for {
+		// If we have a buffered body, rewind it before each attempt.
+		if bodyCopy != nil {
+			if _, err = bodyCopy.Seek(0, io.SeekStart); err != nil {
+				return nil, fmt.Errorf("rewinding request body: %w", err)
+			}
+			req.Body = io.NopCloser(bodyCopy)
+		}
+
+		// Perform the actual HTTP request.
+		resp, err = rt.transport.RoundTrip(req)
 
 		// -----------------------------------------------------------------
-		// 2a️⃣ Idempotency‑Key handling (adds header if configured).
+		// 3a️⃣  Determine whether we should retry.
 		// -----------------------------------------------------------------
-		if c.idempotencyMethods[curReq.Method] {
-			if curReq.Header.Get("Idempotency-Key") == "" {
-				curReq.Header.Set("Idempotency-Key", uuid.NewString())
+		shouldRetry := false
+		if err != nil {
+			// Transport‑level error (e.g., network failure).
+			shouldRetry = c.retryable(nil, err)
+		} else {
+			// HTTP response received – consult retry predicate.
+			shouldRetry = c.retryable(resp, nil)
+			// Respect “Retry‑After” header for 429/503 etc.
+			if shouldRetry && resp != nil {
+				retryAfter = parseRetryAfter(resp)
 			}
 		}
 
 		// -----------------------------------------------------------------
-		// 2b️⃣ Execute the request.
+		// 3b️⃣  Exit loop if no retry is needed or max attempts exceeded.
 		// -----------------------------------------------------------------
-		resp, err := rt.transport.RoundTrip(curReq)
+		if !shouldRetry || attempt >= c.maxRetries {
+			break
+		}
+		attempt++
 
 		// -----------------------------------------------------------------
-		// 2c️⃣ Decide whether we should retry.
+		// 3c️⃣  Back‑off before the next attempt.
 		// -----------------------------------------------------------------
-		shouldRetry := c.retryable(resp, err)
+		backoff := c.calculateBackoff(attempt, retryAfter)
+		select {
+		case <-time.After(backoff):
+			// continue to next attempt
+		case <-req.Context().Done():
+			// request cancelled / timed‑out while waiting
+			return nil, req.Context().Err()
+		}
+	}
 
-		// Record metrics / circuit‑breaker state before possibly retrying.
-		if c.metrics != nil {
-			c.metrics.IncRequests(curReq.Method, curReq.URL.String())
-		}
-		if err != nil || shouldRetry {
-			// Record failure for circuit‑breaker.
-			if c.circuitBreaker != nil {
-				c.circuitBreaker.RecordFailure()
-			}
-			if c.metrics != nil {
-				status := 0
-				if resp != nil {
-					status = resp.StatusCode
-				}
-				c.metrics.IncFailures(curReq.Method, curReq.URL.String(), status)
-			}
-			// Drain/close body if we got a response – we won’t reuse it.
-			if resp != nil && resp.Body != nil {
-				io.Copy(io.Discard, resp.Body)
-				resp.Body.Close()
-			}
-			lastErr = err
-
-			// If this was the last allowed attempt, give up.
-			if attempt == c.maxRetries-1 {
-				break
-			}
-			// Back‑off before the next attempt.
-			delay := c.calculateBackoff(attempt, 0) // No Retry‑After header handling.
-			time.Sleep(delay)
-			continue
-		}
-
-		// -----------------------------------------------------------------
-		// 2d️⃣ SUCCESS – record success and optionally validate.
-		// -----------------------------------------------------------------
-		if c.circuitBreaker != nil {
-			c.circuitBreaker.RecordSuccess()
-		}
-		if c.metrics != nil {
-			c.metrics.IncRequests(curReq.Method, curReq.URL.String())
-		}
-		if c.validateResponse != nil {
-			if vErr := c.validateResponse(resp); vErr != nil {
-				// Treat validation failure as retryable.
-				lastErr = vErr
-				if resp.Body != nil {
-					io.Copy(io.Discard, resp.Body)
-					resp.Body.Close()
-				}
-				if attempt == c.maxRetries-1 {
-					break
-				}
-				delay := c.calculateBackoff(attempt, 0)
-				time.Sleep(delay)
-				continue
-			}
-		}
-
-		// -----------------------------------------------------------------
-		// Preserve the response body for the caller (so readAndDecode works).
-		// -----------------------------------------------------------------
+	// -----------------------------------------------------------------
+	// 4️⃣  Post‑response housekeeping – this block **must run
+	//     unconditionally** because it restores the response body for the
+	//     caller and updates rate‑limit / circuit‑breaker state.
+	// -----------------------------------------------------------------
+	if resp != nil {
+		// -------------------------------------------------------------
+		// 4a️⃣ Preserve the body for the caller.
+		//
+		// The transport may have already consumed the body (e.g. when
+		// retries were performed). We read the entire payload, close the
+		// original body, and replace it with a fresh NopCloser backed by a
+		// byte slice so that the caller can read it exactly once.
+		// -------------------------------------------------------------
 		if resp.Body != nil {
-			b, readErr := io.ReadAll(resp.Body)
+			bodyBytes, readErr := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			if readErr != nil {
-				return nil, readErr
+				// Record the failure (if metrics are enabled) and surface the error.
+				if c.metrics != nil {
+					c.metrics.IncFailures(req.Method, req.URL.String(), 0)
+				}
+				return nil, fmt.Errorf("reading final response body: %w", readErr)
 			}
-			resp.Body = io.NopCloser(bytes.NewReader(b))
+			resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
 
-		return resp, nil
+		// -------------------------------------------------------------
+		// 4b️⃣ Dynamic rate‑limit adjustment (if enabled).
+		// -------------------------------------------------------------
+		if c.dynamicRateAdjustment {
+			c.adjustRateLimiter(resp)
+		}
+
+		// -------------------------------------------------------------
+		// 4c️⃣ Circuit‑breaker state update.
+		// -------------------------------------------------------------
+		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+			if c.circuitBreaker != nil {
+				c.circuitBreaker.RecordSuccess()
+			}
+		} else {
+			recordFailure(c, req, resp.StatusCode)
+		}
 	}
 
-	// All attempts exhausted – return the last error we saw.
-	if lastErr != nil {
-		return nil, lastErr
+	// -----------------------------------------------------------------
+	// 5️⃣  Metrics collection – this is optional and now runs **after**
+	//     the body has been restored, so the caller always receives a
+	//     readable response.
+	// -----------------------------------------------------------------
+	if c.metrics != nil {
+		latency := time.Since(start)
+		c.metrics.ObserveLatency(req.Method, req.URL.String(), latency)
 	}
-	return nil, fmt.Errorf("request failed after %d attempts", c.maxRetries)
+
+	// -----------------------------------------------------------------
+	// 6️⃣  Return the (potentially retried) response and any error.
+	// -----------------------------------------------------------------
+	return resp, err
 }
 
 // -----------------------------------------------------------------------------
