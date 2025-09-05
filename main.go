@@ -583,23 +583,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	}
 
 	// -----------------------------------------------------------------
-	// 3️⃣ Preserve the response body for the caller.
-	//
-	// The transport already buffered the body, but callers may also invoke
-	// `Do` directly (bypassing the transport’s RoundTrip).  To be safe we
-	// always read‑and‑restore the body here.
-	// -----------------------------------------------------------------
-	if resp.Body != nil {
-		bodyBytes, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			return nil, fmt.Errorf("buffering response body: %w", readErr)
-		}
-		resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-	}
-
-	// -----------------------------------------------------------------
-	// 4️⃣ Optional logging / metrics can be added here without touching
+	// 3️⃣ Optional logging / metrics can be added here without touching
 	//    the body again.
 	// -----------------------------------------------------------------
 	if c.logger != nil {
