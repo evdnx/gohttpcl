@@ -240,12 +240,18 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	var lastErr error
-	for attempt := 0; attempt <= c.maxRetries; attempt++ {
-		// Clone request for each attempt (important for body reuse).
+
+	// --------------------------------------------------------------
+	// NOTE: `maxRetries` now represents the **total number of attempts**
+	// (the original library’s behaviour). The loop therefore runs
+	// `attempt < c.maxRetries`.
+	// --------------------------------------------------------------
+	for attempt := 0; attempt < c.maxRetries; attempt++ {
+		// Clone the request for each attempt (important for body reuse).
 		curReq := cloneRequest(req)
 
 		// -----------------------------------------------------------------
-		// 2a️⃣ Idempotency‑Key handling.
+		// 2a️⃣ Idempotency‑Key handling (adds header if configured).
 		// -----------------------------------------------------------------
 		if c.idempotencyMethods[curReq.Method] {
 			if curReq.Header.Get("Idempotency-Key") == "" {
@@ -285,11 +291,13 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 				resp.Body.Close()
 			}
 			lastErr = err
-			if attempt == c.maxRetries {
+
+			// If this was the last allowed attempt, give up.
+			if attempt == c.maxRetries-1 {
 				break
 			}
 			// Back‑off before the next attempt.
-			delay := c.calculateBackoff(attempt, 0) // no Retry‑After header handling
+			delay := c.calculateBackoff(attempt, 0) // No Retry‑After header handling.
 			time.Sleep(delay)
 			continue
 		}
@@ -311,7 +319,7 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 					io.Copy(io.Discard, resp.Body)
 					resp.Body.Close()
 				}
-				if attempt == c.maxRetries {
+				if attempt == c.maxRetries-1 {
 					break
 				}
 				delay := c.calculateBackoff(attempt, 0)
@@ -320,8 +328,9 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			}
 		}
 
-		// --------------------------- NEW PART ---------------------------
+		// -----------------------------------------------------------------
 		// Preserve the response body for the caller (so readAndDecode works).
+		// -----------------------------------------------------------------
 		if resp.Body != nil {
 			b, readErr := io.ReadAll(resp.Body)
 			resp.Body.Close()
@@ -330,7 +339,6 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			}
 			resp.Body = io.NopCloser(bytes.NewReader(b))
 		}
-		// --------------------------------------------------------------
 
 		return resp, nil
 	}
@@ -339,7 +347,7 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if lastErr != nil {
 		return nil, lastErr
 	}
-	return nil, fmt.Errorf("request failed after %d attempts", c.maxRetries+1)
+	return nil, fmt.Errorf("request failed after %d attempts", c.maxRetries)
 }
 
 // -----------------------------------------------------------------------------

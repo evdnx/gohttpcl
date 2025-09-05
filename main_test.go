@@ -94,15 +94,20 @@ func TestBackoffCalculation(t *testing.T) {
 func TestRetryOnTransientError(t *testing.T) {
 	var attempts int32
 	ts := newTestServer(func(w http.ResponseWriter, r *http.Request) {
-		// First two calls return 502, third succeeds.
-		if atomic.LoadInt32(&attempts) < 2 {
+		// Increment the counter for every request we receive.
+		cur := atomic.AddInt32(&attempts, 1)
+
+		// First two calls (cur == 1 or 2) return 502, third (cur == 3) succeeds.
+		if cur <= 2 {
 			w.WriteHeader(http.StatusBadGateway) // 502
 			return
 		}
-		w.Header().Set("Content-Type", "application/json") // Add Content-Type
+
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"msg":"ok"}`))
 	})
+
 	defer ts.Close()
 
 	c := New(WithMaxRetries(3))
