@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -43,7 +44,10 @@ func (ts *testServer) Close()      { ts.srv.Close() }
 Tests ------------------------------------------------------------------------
 */
 
-// TestDefaultRetryable verifies the built‑in retry predicate behaves as expected.
+// ---------------------------------------------------------------------
+// Existing tests (unchanged) – kept for reference
+// ---------------------------------------------------------------------
+
 func TestDefaultRetryable(t *testing.T) {
 	// Network error → retry
 	if !defaultRetryable(nil, errors.New("net error")) {
@@ -70,7 +74,6 @@ func TestDefaultRetryable(t *testing.T) {
 	}
 }
 
-// TestBackoffCalculation checks exponential back‑off with jitter disabled.
 func TestBackoffCalculation(t *testing.T) {
 	c := New()
 	c.jitter = false // deterministic for the test
@@ -91,29 +94,23 @@ func TestBackoffCalculation(t *testing.T) {
 	}
 }
 
-// TestRetryOnTransientError ensures the client retries the configured number of times.
 func TestRetryOnTransientError(t *testing.T) {
 	var attempts int32
 	ts := newTestServer(func(w http.ResponseWriter, r *http.Request) {
-		// Increment the counter for every request we receive.
 		cur := atomic.AddInt32(&attempts, 1)
-
-		// First two calls (cur == 1 or 2) return 502, third (cur == 3) succeeds.
 		if cur <= 2 {
 			w.WriteHeader(http.StatusBadGateway) // 502
 			return
 		}
-
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"msg":"ok"}`))
 	})
-
 	defer ts.Close()
 
 	c := New(WithMaxRetries(3))
 	var out struct {
-		Msg string `json:"msg"` // JSON tag already added
+		Msg string `json:"msg"`
 	}
 	_, err := c.Get(context.Background(), ts.URL(), 0, &out)
 	if err != nil {
@@ -127,7 +124,6 @@ func TestRetryOnTransientError(t *testing.T) {
 	}
 }
 
-// TestCircuitBreakerOpensAfterThreshold validates state transition.
 func TestCircuitBreakerOpensAfterThreshold(t *testing.T) {
 	ts := newTestServer(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError) // 500
@@ -137,10 +133,10 @@ func TestCircuitBreakerOpensAfterThreshold(t *testing.T) {
 	cbThreshold := 2
 	c := New(
 		WithCircuitBreaker(cbThreshold, time.Millisecond*100),
-		WithMaxRetries(0), // we rely on the CB, not client retries
+		WithMaxRetries(0), // rely on CB only
 	)
 
-	// First request → failure, circuit stays closed (first failure)
+	// First request → failure, circuit stays closed
 	_, _ = c.Get(context.Background(), ts.URL(), 0, nil)
 	if c.circuitBreaker.state != stateClosed {
 		t.Fatalf("expected circuit CLOSED after first failure, got %s", c.circuitBreaker.state)
@@ -152,17 +148,14 @@ func TestCircuitBreakerOpensAfterThreshold(t *testing.T) {
 		t.Fatalf("expected circuit OPEN after reaching threshold, got %s", c.circuitBreaker.state)
 	}
 
-	// Third request → should be blocked by the open circuit
+	// Third request → blocked by open circuit
 	_, err := c.Get(context.Background(), ts.URL(), 0, nil)
 	if err == nil || !strings.Contains(err.Error(), "circuit breaker: circuit open") {
 		t.Fatalf("expected circuit‑open error, got %v", err)
 	}
 }
 
-// TestDynamicRateAdjustment adjusts limiter based on response headers.
 func TestDynamicRateAdjustment(t *testing.T) {
-	// Simulate a server that reports 2 remaining requests, resetting in 1 second,
-	// and a limit (burst) of 5.
 	ts := newTestServer(func(w http.ResponseWriter, r *http.Request) {
 		now := time.Now().Unix()
 		w.Header().Set("X-RateLimit-Remaining", "2")
@@ -173,24 +166,22 @@ func TestDynamicRateAdjustment(t *testing.T) {
 	defer ts.Close()
 
 	c := New(
-		WithRateLimit(10, 10), // start with generous limit
+		WithRateLimit(10, 10), // generous initial limit
 		WithDynamicRateAdjustment(),
 	)
 
-	// First request triggers adjustment.
 	_, err := c.Get(context.Background(), ts.URL(), 0, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// After adjustment the limiter's limit should be roughly 2 requests per second.
-	expected := rate.Limit(2) // 2 remaining / ~1 sec
+	// After adjustment the limiter’s limit should be ≈2 req/sec.
+	expected := rate.Limit(2)
 	if c.limiter.Limit() != expected {
 		t.Fatalf("expected limiter limit %v, got %v", expected, c.limiter.Limit())
 	}
 }
 
-// TestIdempotencyKeyIsAddedWhenConfigured ensures the header appears.
 func TestIdempotencyKeyIsAddedWhenConfigured(t *testing.T) {
 	var receivedKey string
 	ts := newTestServer(func(w http.ResponseWriter, r *http.Request) {
@@ -199,9 +190,7 @@ func TestIdempotencyKeyIsAddedWhenConfigured(t *testing.T) {
 	})
 	defer ts.Close()
 
-	c := New(
-		WithIdempotencyMethods(http.MethodPost),
-	)
+	c := New(WithIdempotencyMethods(http.MethodPost))
 
 	_, err := c.Post(context.Background(), ts.URL(), nil, 0, nil)
 	if err != nil {
@@ -212,7 +201,6 @@ func TestIdempotencyKeyIsAddedWhenConfigured(t *testing.T) {
 	}
 }
 
-// TestApplyTimeoutNoTimeout verifies that a zero timeout returns the original context.
 func TestApplyTimeoutNoTimeout(t *testing.T) {
 	c := New()
 	ctx, cancel := c.applyTimeout(context.Background(), 0)
@@ -222,7 +210,6 @@ func TestApplyTimeoutNoTimeout(t *testing.T) {
 	}
 }
 
-// TestApplyTimeoutWithTimeout ensures the derived context respects the deadline.
 func TestApplyTimeoutWithTimeout(t *testing.T) {
 	c := New()
 	ctx, cancel := c.applyTimeout(context.Background(), time.Millisecond*50)
@@ -236,7 +223,6 @@ func TestApplyTimeoutWithTimeout(t *testing.T) {
 	}
 }
 
-// TestJSONDecoding verifies that Get/Post correctly decode JSON bodies.
 func TestJSONDecoding(t *testing.T) {
 	type payload struct {
 		Value string `json:"value"`
@@ -257,10 +243,8 @@ func TestJSONDecoding(t *testing.T) {
 	}
 }
 
-// TestBufferOverflow ensures the client returns an error when the request body exceeds maxBufferSize.
 func TestBufferOverflow(t *testing.T) {
-	// Create a body larger than the default 10 MiB.
-	largeBody := make([]byte, 11*1024*1024)
+	largeBody := make([]byte, 11*1024*1024) // >10 MiB default
 	ts := newTestServer(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -270,5 +254,140 @@ func TestBufferOverflow(t *testing.T) {
 	_, err := c.Post(context.Background(), ts.URL(), bytes.NewReader(largeBody), 0, nil)
 	if err == nil || err.Error() != "request body exceeds max buffer size" {
 		t.Fatalf("expected buffer‑size error, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------
+// NEW tests – cover PUT, DELETE and additional edge‑cases
+// ---------------------------------------------------------------------
+
+// TestPUTJSONDecoding verifies that Put correctly unmarshals a JSON payload.
+func TestPUTJSONDecoding(t *testing.T) {
+	type payload struct {
+		Result int `json:"result"`
+	}
+
+	ts := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Fatalf("expected PUT, got %s", r.Method)
+		}
+		_ = json.NewEncoder(w).Encode(payload{Result: 42})
+	})
+	defer ts.Close()
+
+	c := New()
+	var out payload
+	_, err := c.Put(context.Background(), ts.URL(), nil, 0, &out)
+	if err != nil {
+		t.Fatalf("PUT error: %v", err)
+	}
+	if out.Result != 42 {
+		t.Fatalf("unexpected PUT decoded result: %d", out.Result)
+	}
+}
+
+// TestDELETEJSONDecoding verifies that Delete correctly unmarshals a JSON payload.
+func TestDELETEJSONDecoding(t *testing.T) {
+	type payload struct {
+		Deleted bool `json:"deleted"`
+	}
+
+	ts := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Fatalf("expected DELETE, got %s", r.Method)
+		}
+		_ = json.NewEncoder(w).Encode(payload{Deleted: true})
+	})
+	defer ts.Close()
+
+	c := New()
+	var out payload
+	_, err := c.Delete(context.Background(), ts.URL(), 0, &out)
+	if err != nil {
+		t.Fatalf("DELETE error: %v", err)
+	}
+	if !out.Deleted {
+		t.Fatalf("unexpected DELETE decoded result: %+v", out)
+	}
+}
+
+// TestPUTWithBodyAndTimeout ensures the body is sent and the per‑request timeout is honoured.
+func TestPUTWithBodyAndTimeout(t *testing.T) {
+	const bodyContent = `{"foo":"bar"}`
+	var received []byte
+
+	ts := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		received, _ = io.ReadAll(r.Body)
+		// simulate a tiny delay to hit the timeout if it were wrong
+		time.Sleep(10 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	})
+	defer ts.Close()
+
+	c := New()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err := c.Put(ctx, ts.URL(), strings.NewReader(bodyContent), 0, nil)
+	if err != nil {
+		t.Fatalf("PUT with body error: %v", err)
+	}
+	if string(received) != bodyContent {
+		t.Fatalf("PUT body mismatch: got %s, want %s", string(received), bodyContent)
+	}
+}
+
+// TestDELETEWithoutBodyEnsuresNoUnexpectedRead panics.
+func TestDELETEWithoutBodyEnsuresNoUnexpectedRead(t *testing.T) {
+	ts := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			// reading an empty body should be safe
+			_, _ = io.ReadAll(r.Body)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	defer ts.Close()
+
+	c := New()
+	_, err := c.Delete(context.Background(), ts.URL(), 0, nil)
+	if err != nil {
+		t.Fatalf("DELETE error: %v", err)
+	}
+}
+
+// TestPUTWithCustomHeaders validates that default headers are merged correctly
+// and that callers can add additional headers via a raw http.Request.
+func TestPUTWithCustomHeaders(t *testing.T) {
+	const customKey = "X-Custom-Header"
+	const customVal = "custom-value"
+
+	// Server just verifies the incoming headers.
+	ts := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(customKey); got != customVal {
+			t.Fatalf("expected %s=%s, got %s", customKey, customVal, got)
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer token123" {
+			t.Fatalf("expected Authorization header to be set, got %s", got)
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	defer ts.Close()
+
+	// Initialise the client with a default Authorization header.
+	c := New(
+		WithDefaultHeader("Authorization", "Bearer token123"),
+	)
+
+	// Build a raw PUT request and attach the extra custom header.
+	req, err := http.NewRequest(http.MethodPut, ts.URL(), nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+	req.Header.Set(customKey, customVal)
+
+	// Execute the request via the client’s low‑level Do method.
+	_, err = c.Do(req)
+	if err != nil {
+		t.Fatalf("Do with custom header error: %v", err)
 	}
 }

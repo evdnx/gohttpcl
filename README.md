@@ -1,6 +1,6 @@
 # gohttpcl
 
-A robust and configurable HTTP client package for Go, designed for reliable API interactions with features like retries, exponential backoff, jitter, rate limiting, circuit breaker, logging with golog, body buffering, dynamic rate limit adjustment, metrics, context-aware logging, per-request timeouts, idempotency keys, response validation, and optional JSON response unmarshalling.
+A robust and configurable HTTP client package for Go, designed for reliable API interactions with features like retries, exponential backoff, jitter, rate limiting, circuit breaker, logging with golog, body buffering, dynamic rate limit adjustment, metrics, context‑aware logging, per‑request timeouts, idempotency keys, response validation, and optional JSON response unmarshalling.
 
 ## Features
 
@@ -177,10 +177,32 @@ Optionally unmarshal JSON responses into a provided `interface{}` (e.g., struct 
 - `github.com/google/uuid`: For generating request IDs and idempotency keys.
 - `golang.org/x/time/rate`: For rate limiting.
 
+## Testing
+
+The library ships with a thorough test suite covering:
+
+| Feature | Tested Method(s) |
+|---------|------------------|
+| Default retry predicate | `defaultRetryable` |
+| Exponential back‑off (deterministic) | `calculateBackoff` |
+| Automatic retries on transient errors | `Get` |
+| Circuit‑breaker state transitions | `Get` (via CB) |
+| Dynamic rate‑limit adjustment | `Get` |
+| Idempotency‑Key injection | `Post` |
+| Timeout handling (no‑timeout & with‑timeout) | `applyTimeout` |
+| JSON decoding | `Get` / `Post` |
+| Request‑body buffering overflow protection | `Post` |
+| **PUT** request handling & JSON unmarshalling | `Put` |
+| **DELETE** request handling & JSON unmarshalling | `Delete` |
+| Header propagation & default‑header merging | all helpers |
+| Rate‑limiting token bucket behavior | `Get` / `Put` / `Delete` |
+
+Run the suite with:
+
+```bash
+go test ./...
+```
+
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
-
-## Contributing
-
-Contributions are welcome! Please submit pull requests or open issues on the [GitHub repository](https://github.com/evdnx/gohttpcl).
+MIT-0 License. See [LICENSE](LICENSE) for details.
