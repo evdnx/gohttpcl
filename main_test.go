@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -39,6 +40,41 @@ func newTestServer(h http.HandlerFunc) *testServer {
 func (ts *testServer) URL() string { return ts.srv.URL }
 func (ts *testServer) Calls() int  { return int(atomic.LoadInt32(&ts.calls)) }
 func (ts *testServer) Close()      { ts.srv.Close() }
+
+type captureServer struct {
+	srv    *httptest.Server
+	header http.Header
+	body   []byte
+	mu     sync.Mutex
+}
+
+func newCaptureServer(handler func(w http.ResponseWriter, r *http.Request)) *captureServer {
+	cs := &captureServer{}
+	cs.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cs.mu.Lock()
+		cs.header = r.Header.Clone()
+		if r.Body != nil {
+			cs.body, _ = io.ReadAll(r.Body)
+		}
+		cs.mu.Unlock()
+		handler(w, r)
+	}))
+	return cs
+}
+
+// helper to spin up a test server that records the request it receives
+func (cs *captureServer) URL() string { return cs.srv.URL }
+func (cs *captureServer) Close()      { cs.srv.Close() }
+func (cs *captureServer) Header() http.Header {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return cs.header.Clone()
+}
+func (cs *captureServer) Body() []byte {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	return append([]byte(nil), cs.body...)
+}
 
 /*
 Tests ------------------------------------------------------------------------
@@ -389,5 +425,213 @@ func TestPUTWithCustomHeaders(t *testing.T) {
 	_, err = c.Do(req)
 	if err != nil {
 		t.Fatalf("Do with custom header error: %v", err)
+	}
+}
+
+func TestDefaultHeadersAreSentWhenNoOpts(t *testing.T) {
+	// Server just returns 200 OK.
+	ts := newCaptureServer(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	defer ts.Close()
+
+	client := New(
+		WithDefaultHeader("X-Foo", "bar"),
+		WithDefaultHeader("Authorization", "Bearer default-token"),
+	)
+
+	// Use Delete (any helper would work) without any per‑request options.
+	_, err := client.Delete(context.Background(), ts.URL(), 0, nil)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+
+	hdr := ts.Header()
+	if got := hdr.Get("X-Foo"); got != "bar" {
+		t.Fatalf("expected X-Foo=bar, got %q", got)
+	}
+	if got := hdr.Get("Authorization"); got != "Bearer default-token" {
+		t.Fatalf("expected Authorization default, got %q", got)
+	}
+}
+
+func TestWithHeaderOverridesDefault(t *testing.T) {
+	ts := newCaptureServer(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	defer ts.Close()
+
+	client := New(
+		WithDefaultHeader("Authorization", "Bearer default-token"),
+	)
+
+	// Override the Authorization header for this request only.
+	_, err := client.Get(
+		context.Background(),
+		ts.URL(),
+		0,
+		nil,
+		WithHeader("Authorization", "Bearer overridden-token"),
+	)
+	if err != nil {
+		t.Fatalf("GET failed: %v", err)
+	}
+
+	hdr := ts.Header()
+	if got := hdr.Get("Authorization"); got != "Bearer overridden-token" {
+		t.Fatalf("expected overridden Authorization, got %q", got)
+	}
+}
+
+func TestWithHeadersMultiValue(t *testing.T) {
+	ts := newCaptureServer(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	defer ts.Close()
+
+	client := New()
+
+	// Build a multi‑value header set.
+	h := http.Header{}
+	h.Add("Set-Cookie", "a=1; Path=/")
+	h.Add("Set-Cookie", "b=2; Path=/")
+
+	_, err := client.Post(
+		context.Background(),
+		ts.URL(),
+		strings.NewReader(`{}`),
+		0,
+		nil,
+		WithHeaders(h),
+	)
+	if err != nil {
+		t.Fatalf("POST failed: %v", err)
+	}
+
+	hdr := ts.Header()
+	cookies := hdr["Set-Cookie"]
+	if len(cookies) != 2 {
+		t.Fatalf("expected 2 Set-Cookie values, got %d", len(cookies))
+	}
+	if cookies[0] != "a=1; Path=/" || cookies[1] != "b=2; Path=/" {
+		t.Fatalf("unexpected Set-Cookie values: %v", cookies)
+	}
+}
+
+func TestMultipleOptionOrder(t *testing.T) {
+	ts := newCaptureServer(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	defer ts.Close()
+
+	client := New(
+		WithDefaultHeader("X-Test", "default"),
+	)
+
+	// First we add a multi‑value header set, then we override with a single WithHeader.
+	hdrSet := http.Header{}
+	hdrSet.Add("X-Test", "from-WithHeaders")
+
+	_, err := client.Put(
+		context.Background(),
+		ts.URL(),
+		strings.NewReader(`{}`),
+		0,
+		nil,
+		WithHeaders(hdrSet),           // adds X-Test=from-WithHeaders
+		WithHeader("X-Test", "final"), // should overwrite the previous value
+	)
+	if err != nil {
+		t.Fatalf("PUT failed: %v", err)
+	}
+
+	hdr := ts.Header()
+	if got := hdr.Get("X-Test"); got != "final" {
+		t.Fatalf("expected final X-Test header to be 'final', got %q", got)
+	}
+}
+
+func TestAllHelpersRespectOptions(t *testing.T) {
+	// Server echoes back the method name so we know which helper was called.
+	ts := newCaptureServer(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Echo-Method", r.Method) // <-- response header
+		w.WriteHeader(http.StatusOK)
+	})
+	defer ts.Close()
+
+	client := New()
+
+	// Helper map: method name → function to invoke.
+	helpers := map[string]func() (*http.Response, error){
+		"GET": func() (*http.Response, error) {
+			return client.Get(context.Background(), ts.URL(), 0, nil,
+				WithHeader("X-From", "GET"))
+		},
+		"POST": func() (*http.Response, error) {
+			return client.Post(context.Background(), ts.URL(),
+				strings.NewReader(`{}`), 0, nil,
+				WithHeader("X-From", "POST"))
+		},
+		"PUT": func() (*http.Response, error) {
+			return client.Put(context.Background(), ts.URL(),
+				strings.NewReader(`{}`), 0, nil,
+				WithHeader("X-From", "PUT"))
+		},
+		"DELETE": func() (*http.Response, error) {
+			return client.Delete(context.Background(), ts.URL(), 0, nil,
+				WithHeader("X-From", "DELETE"))
+		},
+	}
+
+	for wantMethod, fn := range helpers {
+		resp, err := fn()
+		if err != nil {
+			t.Fatalf("%s helper returned error: %v", wantMethod, err)
+		}
+		// 1️⃣ Verify the **response** header that the server set.
+		if got := resp.Header.Get("X-Echo-Method"); got != wantMethod {
+			t.Fatalf("expected server to receive %s, got %s", wantMethod, got)
+		}
+		// 2️⃣ Verify the per‑request header that we injected.
+		if got := ts.Header().Get("X-From"); got != wantMethod {
+			t.Fatalf("%s helper did not forward per‑request header, got %q", wantMethod, got)
+		}
+	}
+}
+
+func TestOptionsDoNotLeakBetweenCalls(t *testing.T) {
+	ts := newCaptureServer(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	defer ts.Close()
+
+	client := New(
+		WithDefaultHeader("X-Common", "common"),
+	)
+
+	// First request supplies a temporary header.
+	_, err := client.Get(context.Background(), ts.URL(), 0, nil,
+		WithHeader("X-Temp", "first"),
+	)
+	if err != nil {
+		t.Fatalf("first GET failed: %v", err)
+	}
+	hdr1 := ts.Header()
+	if got := hdr1.Get("X-Temp"); got != "first" {
+		t.Fatalf("first request missing X-Temp header")
+	}
+
+	// Second request does **not** specify X-Temp; it must NOT appear.
+	_, err = client.Get(context.Background(), ts.URL(), 0, nil)
+	if err != nil {
+		t.Fatalf("second GET failed: %v", err)
+	}
+	hdr2 := ts.Header()
+	if got := hdr2.Get("X-Temp"); got != "" {
+		t.Fatalf("second request leaked X-Temp header: %q", got)
+	}
+	// Ensure the common default header is still there.
+	if got := hdr2.Get("X-Common"); got != "common" {
+		t.Fatalf("common header missing on second request")
 	}
 }
