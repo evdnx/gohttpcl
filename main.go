@@ -113,6 +113,50 @@ func readAndDecode(resp *http.Response, out interface{}) error {
 	return nil
 }
 
+// ------------------------------------------------------------
+// Per‑request functional options
+// ------------------------------------------------------------
+
+// ReqOption configures a single http.Request before it is sent.
+type ReqOption func(*http.Request)
+
+// WithHeader returns a ReqOption that sets (or overwrites) a header
+// on the outgoing request.  Multiple calls add/override independently.
+func WithHeader(key, value string) ReqOption {
+	return func(r *http.Request) {
+		r.Header.Set(key, value)
+	}
+}
+
+// WithHeaders returns a ReqOption that copies every entry from the
+// supplied http.Header (preserving multi‑value semantics) onto the request.
+func WithHeaders(h http.Header) ReqOption {
+	return func(r *http.Request) {
+		for k, vv := range h {
+			for _, v := range vv {
+				r.Header.Add(k, v)
+			}
+		}
+	}
+}
+
+// applyReqOptions merges the client‑wide default headers with any
+// per‑request options supplied by the caller.
+func (c *Client) applyReqOptions(req *http.Request, opts []ReqOption) {
+	// 1️⃣ Apply client‑wide defaults first.
+	for k, v := range c.defaultHeaders {
+		// Only set if the caller hasn’t overridden it later.
+		if req.Header.Get(k) == "" {
+			req.Header.Set(k, v)
+		}
+	}
+	// 2️⃣ Apply each functional option (they may add/override headers,
+	//    inject tracing IDs, etc.).
+	for _, opt := range opts {
+		opt(req)
+	}
+}
+
 // New creates a new Client applying any supplied Options.
 func New(opts ...Option) *Client {
 	c := &Client{
@@ -550,157 +594,149 @@ func (c *Client) applyTimeout(parent context.Context, timeout time.Duration) (co
 	return parent, func() {}
 }
 
-// Get performs an HTTP GET request, optionally unmarshalling a JSON response
-// into the provided out value. The caller must close resp.Body when finished.
+// Get performs an HTTP GET with optional per‑request options.
 func (c *Client) Get(
 	ctx context.Context,
 	url string,
 	timeout time.Duration,
 	out interface{},
+	opts ...ReqOption,
 ) (*http.Response, error) {
-
-	// 1️⃣ Build request
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
+	c.applyReqOptions(req, opts)
 
-	// 2️⃣ Apply per‑request timeout (if any)
+	// Apply per‑request timeout.
 	ctx, cancel := c.applyTimeout(req.Context(), timeout)
 	defer cancel()
 	req = req.WithContext(ctx)
 
-	// 3️⃣ Send request through the client (retries, rate‑limit, etc.)
 	resp, err := c.Do(req)
 	if err != nil {
-		// Unwrap possible *url.Error to expose the original cause.
+		// Preserve original behaviour for url.Error unwrapping.
 		if ue, ok := err.(*neturl.Error); ok {
-			err = ue.Err
+			if ue.Err != nil {
+				return nil, ue.Err
+			}
+			return nil, ue
 		}
 		return nil, err
 	}
-
-	// 4️⃣ Decode JSON payload (if a destination was supplied)
-	if err = readAndDecode(resp, out); err != nil {
-		return resp, err
+	if out != nil {
+		if err = readAndDecode(resp, out); err != nil {
+			return resp, err
+		}
 	}
 	return resp, nil
 }
 
-// Post performs an HTTP POST request with the given body, optionally
-// unmarshalling a JSON response into out.  The caller must close resp.Body.
+// Post performs an HTTP POST with optional per‑request options.
 func (c *Client) Post(
 	ctx context.Context,
 	url string,
 	body io.Reader,
 	timeout time.Duration,
 	out interface{},
+	opts ...ReqOption,
 ) (*http.Response, error) {
-
-	// 1️⃣ Build request
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
 	if err != nil {
 		return nil, err
 	}
+	c.applyReqOptions(req, opts)
 
-	// 2️⃣ Apply per‑request timeout (if any)
 	ctx, cancel := c.applyTimeout(req.Context(), timeout)
 	defer cancel()
 	req = req.WithContext(ctx)
 
-	// 3️⃣ Send request
 	resp, err := c.Do(req)
 	if err != nil {
-		// Unwrap possible *url.Error to expose the original cause.
 		if ue, ok := err.(*neturl.Error); ok {
-			err = ue.Err
+			if ue.Err != nil {
+				return nil, ue.Err
+			}
+			return nil, ue
 		}
 		return nil, err
 	}
-
-	// 4️⃣ Decode JSON payload
-	if out != nil && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
-		if decErr := json.NewDecoder(resp.Body).Decode(out); decErr != nil && decErr != io.EOF {
-			return resp, fmt.Errorf("decoding response: %w", decErr)
+	if out != nil {
+		if err = readAndDecode(resp, out); err != nil {
+			return resp, err
 		}
 	}
 	return resp, nil
 }
 
-// Put performs an HTTP PUT request with the given body, optionally
-// unmarshalling a JSON response into out.  The caller must close resp.Body.
+// Put performs an HTTP PUT with optional per‑request options.
 func (c *Client) Put(
 	ctx context.Context,
 	url string,
 	body io.Reader,
 	timeout time.Duration,
 	out interface{},
+	opts ...ReqOption,
 ) (*http.Response, error) {
-
-	// 1️⃣ Build request
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, url, body)
 	if err != nil {
 		return nil, err
 	}
+	c.applyReqOptions(req, opts)
 
-	// 2️⃣ Apply per‑request timeout (if any)
 	ctx, cancel := c.applyTimeout(req.Context(), timeout)
 	defer cancel()
 	req = req.WithContext(ctx)
 
-	// 3️⃣ Send request
 	resp, err := c.Do(req)
 	if err != nil {
-		// Unwrap possible *url.Error to expose the original cause.
 		if ue, ok := err.(*neturl.Error); ok {
-			err = ue.Err
+			if ue.Err != nil {
+				return nil, ue.Err
+			}
+			return nil, ue
 		}
 		return nil, err
 	}
-
-	// 4️⃣ Decode JSON payload
-	if out != nil && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
-		if decErr := json.NewDecoder(resp.Body).Decode(out); decErr != nil && decErr != io.EOF {
-			return resp, fmt.Errorf("decoding response: %w", decErr)
+	if out != nil {
+		if err = readAndDecode(resp, out); err != nil {
+			return resp, err
 		}
 	}
 	return resp, nil
 }
 
-// Delete performs an HTTP DELETE request, optionally unmarshalling a JSON
-// response into out.  The caller must close resp.Body.
+// Delete performs an HTTP DELETE with optional per‑request options.
 func (c *Client) Delete(
 	ctx context.Context,
 	url string,
 	timeout time.Duration,
 	out interface{},
+	opts ...ReqOption,
 ) (*http.Response, error) {
-
-	// 1️⃣ Build request (no body)
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
 	if err != nil {
 		return nil, err
 	}
+	c.applyReqOptions(req, opts)
 
-	// 2️⃣ Apply per‑request timeout (if any)
 	ctx, cancel := c.applyTimeout(req.Context(), timeout)
 	defer cancel()
 	req = req.WithContext(ctx)
 
-	// 3️⃣ Send request
 	resp, err := c.Do(req)
 	if err != nil {
-		// Unwrap possible *url.Error to expose the original cause.
 		if ue, ok := err.(*neturl.Error); ok {
-			err = ue.Err
+			if ue.Err != nil {
+				return nil, ue.Err
+			}
+			return nil, ue
 		}
 		return nil, err
 	}
-
-	// 4️⃣ Decode JSON payload
-	if out != nil && resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
-		if decErr := json.NewDecoder(resp.Body).Decode(out); decErr != nil && decErr != io.EOF {
-			return resp, fmt.Errorf("decoding response: %w", decErr)
+	if out != nil {
+		if err = readAndDecode(resp, out); err != nil {
+			return resp, err
 		}
 	}
 	return resp, nil
