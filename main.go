@@ -184,10 +184,22 @@ func New(opts ...Option) *Client {
 		opt(c)
 	}
 
-	// Install the retry transport once the client is fully configured.
-	c.client.Transport = &retryTransport{
-		transport: http.DefaultTransport,
-		client:    c,
+	switch rt := c.client.Transport.(type) {
+	case *retryTransport:
+		// Option provided a fully configured retry transport; make sure it points back to us.
+		rt.client = c
+		if rt.transport == nil {
+			rt.transport = http.DefaultTransport
+		}
+	default:
+		base := c.client.Transport
+		if base == nil {
+			base = http.DefaultTransport
+		}
+		c.client.Transport = &retryTransport{
+			transport: base,
+			client:    c,
+		}
 	}
 
 	// Seed the jitter generator once per process.
@@ -242,16 +254,16 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	//       same payload.
 	// -----------------------------------------------------------------
 	var bodyCopy io.ReadSeeker
-	if req.Body != nil && c.maxBufferSize > 0 {
+	if req.Body != nil {
 		// Check size & obtain a seekable copy.
 		b, err := bufferRequestBody(req, c.maxBufferSize)
 		if err != nil {
 			return nil, err
 		}
-		// Keep a copy for retries.
-		bodyCopy = bytes.NewReader(b)
-		// Reset the request body for the first attempt.
-		req.Body = io.NopCloser(bytes.NewReader(b))
+		if b != nil {
+			// Keep a copy for retries. bytes.NewReader tolerates zero-length slices.
+			bodyCopy = bytes.NewReader(b)
+		}
 	}
 
 	// -----------------------------------------------------------------
@@ -301,10 +313,19 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 		attempt++
 
+		if resp != nil && resp.Body != nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+		if c.metrics != nil {
+			c.metrics.IncRetries(req.Method, req.URL.String(), attempt)
+		}
+
 		// -----------------------------------------------------------------
 		// 3c️⃣  Back‑off before the next attempt.
 		// -----------------------------------------------------------------
 		backoff := c.calculateBackoff(attempt, retryAfter)
+		retryAfter = 0
 		select {
 		case <-time.After(backoff):
 			// continue to next attempt
@@ -411,25 +432,40 @@ func bufferRequestBody(req *http.Request, maxSize int64) ([]byte, error) {
 	if req.Body == nil {
 		return nil, nil
 	}
-	var bodyBytes []byte
-	var err error
+	original := req.Body
+	defer func() {
+		if original != nil {
+			_ = original.Close()
+		}
+	}()
+
+	var (
+		bodyBytes []byte
+		err       error
+	)
 
 	if maxSize > 0 {
-		bodyBytes, err = io.ReadAll(io.LimitReader(req.Body, maxSize))
+		limit := maxSize
+		checkOverflow := true
+		if maxSize < math.MaxInt64 {
+			limit++
+		} else {
+			checkOverflow = false
+		}
+		bodyBytes, err = io.ReadAll(io.LimitReader(original, limit))
 		if err != nil {
 			return nil, fmt.Errorf("buffering body: %w", err)
 		}
-		if int64(len(bodyBytes)) >= maxSize {
+		if checkOverflow && int64(len(bodyBytes)) > maxSize {
 			return nil, errors.New("request body exceeds max buffer size")
 		}
 	} else {
-		bodyBytes, err = io.ReadAll(req.Body)
+		bodyBytes, err = io.ReadAll(original)
 		if err != nil {
 			return nil, fmt.Errorf("buffering body: %w", err)
 		}
 	}
-	// Close the original body and replace it with a fresh reader.
-	_ = req.Body.Close()
+
 	req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 	return bodyBytes, nil
 }
@@ -487,33 +523,107 @@ func (c *Client) adjustRateLimiter(resp *http.Response) {
 	resetStr := resp.Header.Get(c.rateLimitHeaderPrefix + "-Reset")
 	limitStr := resp.Header.Get(c.rateLimitHeaderPrefix + "-Limit")
 
-	if remainingStr == "" || resetStr == "" {
+	if remainingStr == "" && limitStr == "" {
 		return
 	}
-	remaining, err := strconv.ParseFloat(remainingStr, 64)
-	if err != nil {
-		return
+	var (
+		remaining    float64
+		remainingSet bool
+	)
+	if remainingStr != "" {
+		val, err := strconv.ParseFloat(remainingStr, 64)
+		if err != nil {
+			return
+		}
+		remaining = val
+		remainingSet = true
 	}
-	// Use a fixed 1‑second window for the calculation – this matches the unit test
-	// expectations and avoids race conditions caused by the elapsed time between
-	// the server setting the header and us reading it.
-	newRate := rate.Limit(remaining / 1.0)
 
-	// Update burst if the server supplies a limit.
+	var (
+		limit    float64
+		limitSet bool
+	)
 	if limitStr != "" {
-		if burst, err := strconv.Atoi(limitStr); err == nil {
-			c.limiterMu.Lock()
-			c.limiter.SetBurst(burst)
-			c.limiterMu.Unlock()
+		val, err := strconv.ParseFloat(limitStr, 64)
+		if err == nil {
+			limit = val
+			limitSet = true
 		}
 	}
+
+	window := c.rateWindow
+	if window <= 0 {
+		window = time.Second
+	}
+	now := time.Now()
+	if resetStr != "" {
+		if dur, ok := parseResetWindow(resetStr, now); ok && dur > 0 {
+			window = dur
+		}
+	}
+	if window <= 0 {
+		window = time.Second
+	}
+
+	rateValue := 0.0
+	if remainingSet && remaining > 0 {
+		rateValue = remaining / window.Seconds()
+	} else if limitSet && limit > 0 {
+		rateValue = limit / window.Seconds()
+	}
+	if rateValue <= 0 {
+		return
+	}
+
+	newRate := rate.Limit(rateValue)
+
+	var newBurst int
+	if limitStr != "" {
+		if burst, err := strconv.Atoi(limitStr); err == nil {
+			newBurst = burst
+		}
+	}
+
+	requestID := ""
+	if resp.Request != nil {
+		requestID = getRequestID(resp.Request.Context())
+	}
+
+	c.limiterMu.Lock()
+	if newBurst > 0 {
+		c.limiter.SetBurst(newBurst)
+	}
 	if newRate > 0 {
-		c.limiterMu.Lock()
 		c.limiter.SetLimit(newRate)
-		c.limiterMu.Unlock()
-		logInfo(c.logger, "adjusted rate limit", getRequestID(resp.Request.Context()),
+	}
+	c.limiterMu.Unlock()
+
+	if newRate > 0 {
+		logInfo(c.logger, "adjusted rate limit", requestID,
 			golog.Float64("rate", float64(newRate)))
 	}
+}
+
+func parseResetWindow(value string, now time.Time) (time.Duration, bool) {
+	if value == "" {
+		return 0, false
+	}
+	if secs, err := strconv.ParseFloat(value, 64); err == nil {
+		if secs > 0 && secs < 1e9 {
+			return time.Duration(secs * float64(time.Second)), true
+		}
+		if secs >= 1e9 {
+			secPart, frac := math.Modf(secs)
+			resetTime := time.Unix(int64(secPart), int64(frac*float64(time.Second)))
+			if resetTime.After(now) {
+				return resetTime.Sub(now), true
+			}
+		}
+	}
+	if ts, err := http.ParseTime(value); err == nil && ts.After(now) {
+		return ts.Sub(now), true
+	}
+	return 0, false
 }
 
 // -----------------------------------------------------------------------------
@@ -845,7 +955,12 @@ func WithTimeout(d time.Duration) Option {
 }
 
 func WithTransport(tr http.RoundTripper) Option {
-	return func(c *Client) { c.client.Transport = &retryTransport{transport: tr, client: c} }
+	return func(c *Client) {
+		if tr == nil {
+			tr = http.DefaultTransport
+		}
+		c.client.Transport = tr
+	}
 }
 
 func WithDefaultHeader(key, value string) Option {

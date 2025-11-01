@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -14,8 +15,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"golang.org/x/time/rate"
 )
 
 /*
@@ -74,6 +73,90 @@ func (cs *captureServer) Body() []byte {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	return append([]byte(nil), cs.body...)
+}
+
+type countingBody struct {
+	mu     sync.Mutex
+	closed bool
+}
+
+func (cb *countingBody) Read(p []byte) (int, error) { return 0, io.EOF }
+
+func (cb *countingBody) Close() error {
+	cb.mu.Lock()
+	cb.closed = true
+	cb.mu.Unlock()
+	return nil
+}
+
+func (cb *countingBody) Closed() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	return cb.closed
+}
+
+type recordingTransport struct {
+	mu     sync.Mutex
+	calls  int
+	bodies []*countingBody
+}
+
+func (rt *recordingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.calls++
+	if rt.calls == 1 {
+		body := &countingBody{}
+		rt.bodies = append(rt.bodies, body)
+		return &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Body:       body,
+			Header:     make(http.Header),
+			Request:    req,
+		}, nil
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(strings.NewReader("ok")),
+		Header:     make(http.Header),
+		Request:    req,
+	}, nil
+}
+
+func (rt *recordingTransport) FirstBodyClosed() bool {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if len(rt.bodies) == 0 {
+		return false
+	}
+	return rt.bodies[0].Closed()
+}
+
+func (rt *recordingTransport) CallCount() int {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return rt.calls
+}
+
+type metricsRecorder struct {
+	mu      sync.Mutex
+	retries []int
+}
+
+func (m *metricsRecorder) IncRequests(string, string) {}
+func (m *metricsRecorder) IncRetries(_ string, _ string, attempt int) {
+	m.mu.Lock()
+	m.retries = append(m.retries, attempt)
+	m.mu.Unlock()
+}
+func (m *metricsRecorder) IncFailures(string, string, int)              {}
+func (m *metricsRecorder) ObserveLatency(string, string, time.Duration) {}
+func (m *metricsRecorder) RetryAttempts() []int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]int, len(m.retries))
+	copy(out, m.retries)
+	return out
 }
 
 /*
@@ -193,9 +276,8 @@ func TestCircuitBreakerOpensAfterThreshold(t *testing.T) {
 
 func TestDynamicRateAdjustment(t *testing.T) {
 	ts := newTestServer(func(w http.ResponseWriter, r *http.Request) {
-		now := time.Now().Unix()
 		w.Header().Set("X-RateLimit-Remaining", "2")
-		w.Header().Set("X-RateLimit-Reset", strconv.FormatInt(now+1, 10))
+		w.Header().Set("X-RateLimit-Reset", "1")
 		w.Header().Set("X-RateLimit-Limit", "5")
 		w.WriteHeader(http.StatusOK)
 	})
@@ -211,10 +293,67 @@ func TestDynamicRateAdjustment(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// After adjustment the limiter’s limit should be ≈2 req/sec.
-	expected := rate.Limit(2)
-	if c.limiter.Limit() != expected {
-		t.Fatalf("expected limiter limit %v, got %v", expected, c.limiter.Limit())
+	// After adjustment the limiter’s limit should be close to 2 req/sec.
+	const expected = 2.0
+	if diff := math.Abs(float64(c.limiter.Limit()) - expected); diff > 0.25 {
+		t.Fatalf("expected limiter limit approximately %v, got %v (diff=%v)", expected, c.limiter.Limit(), diff)
+	}
+}
+
+func TestRetryTransportClosesBodyAndRecordsRetries(t *testing.T) {
+	rt := &recordingTransport{}
+	metrics := &metricsRecorder{}
+	c := New(
+		WithTransport(rt),
+		WithMaxRetries(1),
+		WithMetrics(metrics),
+	)
+
+	_, err := c.Post(context.Background(), "http://example.com", strings.NewReader("payload"), 0, nil)
+	if err != nil {
+		t.Fatalf("post failed: %v", err)
+	}
+
+	if rt.CallCount() != 2 {
+		t.Fatalf("expected 2 transport calls (1 retry), got %d", rt.CallCount())
+	}
+	if !rt.FirstBodyClosed() {
+		t.Fatalf("expected response body to be closed before retry")
+	}
+	if attempts := metrics.RetryAttempts(); len(attempts) != 1 || attempts[0] != 1 {
+		t.Fatalf("expected metrics to record retry attempt 1, got %v", attempts)
+	}
+}
+
+func TestParseResetWindow(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	validHTTPDate := now.Add(3 * time.Second).UTC().Format(http.TimeFormat)
+
+	tests := []struct {
+		name  string
+		value string
+		want  time.Duration
+		ok    bool
+	}{
+		{"seconds offset", "5", 5 * time.Second, true},
+		{"epoch seconds", strconv.FormatInt(now.Add(2*time.Second).Unix(), 10), 2 * time.Second, true},
+		{"http date", validHTTPDate, 3 * time.Second, true},
+		{"invalid", "not-a-number", 0, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := parseResetWindow(tt.value, now)
+			if ok != tt.ok {
+				t.Fatalf("expected ok=%v, got %v", tt.ok, ok)
+			}
+			if !tt.ok {
+				return
+			}
+			if diff := math.Abs(float64(got - tt.want)); diff > float64(20*time.Millisecond) {
+				t.Fatalf("expected %v, got %v", tt.want, got)
+			}
+		})
 	}
 }
 
@@ -290,6 +429,46 @@ func TestBufferOverflow(t *testing.T) {
 	_, err := c.Post(context.Background(), ts.URL(), bytes.NewReader(largeBody), 0, nil)
 	if err == nil || err.Error() != "request body exceeds max buffer size" {
 		t.Fatalf("expected buffer‑size error, got %v", err)
+	}
+}
+
+func TestBufferRequestBodyAllowsExactLimit(t *testing.T) {
+	body := bytes.Repeat([]byte("a"), 1024)
+	req := httptest.NewRequest(http.MethodPost, "http://example.com", bytes.NewReader(body))
+
+	data, err := bufferRequestBody(req, int64(len(body)))
+	if err != nil {
+		t.Fatalf("unexpected error buffering body: %v", err)
+	}
+	if !bytes.Equal(data, body) {
+		t.Fatalf("buffered body mismatch")
+	}
+	replay, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read rewound body: %v", err)
+	}
+	if !bytes.Equal(replay, body) {
+		t.Fatalf("rewound body mismatch")
+	}
+}
+
+func TestBufferRequestBodyUnlimited(t *testing.T) {
+	body := []byte("payload")
+	req := httptest.NewRequest(http.MethodPost, "http://example.com", bytes.NewReader(body))
+
+	data, err := bufferRequestBody(req, 0)
+	if err != nil {
+		t.Fatalf("unexpected error buffering body with unlimited size: %v", err)
+	}
+	if !bytes.Equal(data, body) {
+		t.Fatalf("buffered body mismatch")
+	}
+	replay, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("failed to read rewound body: %v", err)
+	}
+	if !bytes.Equal(replay, body) {
+		t.Fatalf("rewound body mismatch")
 	}
 }
 
