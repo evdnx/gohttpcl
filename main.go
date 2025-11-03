@@ -39,6 +39,16 @@ type MetricsCollector interface {
 	ObserveLatency(method, url string, duration time.Duration)
 }
 
+// BackoffStrategy identifies the algorithm used to compute delays between retries.
+type BackoffStrategy string
+
+const (
+	BackoffExponential BackoffStrategy = "exponential"
+	BackoffLinear      BackoffStrategy = "linear"
+	BackoffFibonacci   BackoffStrategy = "fibonacci"
+	BackoffConstant    BackoffStrategy = "constant"
+)
+
 // contextKey is a private type for context values.
 type contextKey string
 
@@ -57,6 +67,7 @@ type Client struct {
 	minBackoff            time.Duration
 	maxBackoff            time.Duration
 	backoffFactor         float64
+	backoffStrategy       BackoffStrategy
 	jitter                bool
 	retryable             func(*http.Response, error) bool
 	defaultHeaders        map[string]string
@@ -67,6 +78,7 @@ type Client struct {
 	dynamicRateAdjustment bool
 	rateWindow            time.Duration
 	metrics               MetricsCollector
+	retryBudget           *RetryBudget
 	maxBufferSize         int64
 	rateLimitHeaderPrefix string
 	idempotencyMethods    map[string]bool
@@ -165,6 +177,7 @@ func New(opts ...Option) *Client {
 		minBackoff:            time.Second,
 		maxBackoff:            30 * time.Second,
 		backoffFactor:         2.0,
+		backoffStrategy:       BackoffExponential,
 		jitter:                true,
 		retryable:             defaultRetryable,
 		defaultHeaders:        make(map[string]string),
@@ -277,6 +290,8 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		retryAfter time.Duration
 	)
 
+	c.retryBudget.RecordRequest()
+
 	for {
 		// If we have a buffered body, rewind it before each attempt.
 		if bodyCopy != nil {
@@ -312,6 +327,11 @@ func (rt *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			break
 		}
 		attempt++
+
+		if !c.retryBudget.AllowRetry() {
+			break
+		}
+		c.retryBudget.RecordRetry()
 
 		if resp != nil && resp.Body != nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
@@ -478,7 +498,22 @@ func (c *Client) calculateBackoff(attempt int, retryAfter time.Duration) time.Du
 	if retryAfter > 0 {
 		return retryAfter
 	}
-	base := float64(c.minBackoff) * math.Pow(c.backoffFactor, float64(attempt))
+	var base float64
+	switch c.backoffStrategy {
+	case BackoffConstant:
+		base = float64(c.minBackoff)
+	case BackoffLinear:
+		multiplier := float64(attempt + 1)
+		base = float64(c.minBackoff) * multiplier
+	case BackoffFibonacci:
+		n := attempt + 1
+		if n < 1 {
+			n = 1
+		}
+		base = float64(c.minBackoff) * float64(fibonacciNumber(n))
+	default: // BackoffExponential (also default for unknown values)
+		base = float64(c.minBackoff) * math.Pow(c.backoffFactor, float64(attempt))
+	}
 	if base > float64(c.maxBackoff) {
 		base = float64(c.maxBackoff)
 	}
@@ -509,6 +544,91 @@ func parseRetryAfter(resp *http.Response) time.Duration {
 		return time.Until(t)
 	}
 	return 0
+}
+
+func fibonacciNumber(n int) int {
+	if n <= 1 {
+		return 1
+	}
+	a, b := 1, 1
+	for i := 2; i < n; i++ {
+		a, b = b, a+b
+	}
+	return b
+}
+
+// RetryBudget bounds the ratio of retries to requests over a sliding window.
+type RetryBudget struct {
+	maxRatio      float64
+	resetInterval time.Duration
+
+	mu        sync.Mutex
+	requests  int64
+	retries   int64
+	lastReset time.Time
+}
+
+// NewRetryBudget constructs a retry budget. Ratios outside (0,1] are clamped,
+// and a zero/negative reset interval falls back to one hour.
+func NewRetryBudget(maxRatio float64, resetInterval time.Duration) *RetryBudget {
+	switch {
+	case maxRatio > 1:
+		maxRatio = 1
+	case maxRatio <= 0:
+		maxRatio = 0.2
+	}
+	if resetInterval <= 0 {
+		resetInterval = time.Hour
+	}
+	return &RetryBudget{
+		maxRatio:      maxRatio,
+		resetInterval: resetInterval,
+		lastReset:     time.Now(),
+	}
+}
+
+// RecordRequest increments the request counter.
+func (b *RetryBudget) RecordRequest() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.resetIfNeeded()
+	b.requests++
+}
+
+// AllowRetry reports whether issuing another retry would keep the ratio within bounds.
+func (b *RetryBudget) AllowRetry() bool {
+	if b == nil {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.resetIfNeeded()
+	if b.requests == 0 {
+		return true
+	}
+	return float64(b.retries)/float64(b.requests) < b.maxRatio
+}
+
+// RecordRetry increments the retry counter.
+func (b *RetryBudget) RecordRetry() {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.resetIfNeeded()
+	b.retries++
+}
+
+func (b *RetryBudget) resetIfNeeded() {
+	if time.Since(b.lastReset) >= b.resetInterval {
+		b.requests = 0
+		b.retries = 0
+		b.lastReset = time.Now()
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -940,6 +1060,30 @@ func WithMaxBackoff(d time.Duration) Option {
 
 func WithBackoffFactor(f float64) Option {
 	return func(c *Client) { c.backoffFactor = f }
+}
+
+// WithBackoffStrategy selects the algorithm used to compute retry delays.
+func WithBackoffStrategy(strategy BackoffStrategy) Option {
+	return func(c *Client) {
+		switch strategy {
+		case BackoffConstant, BackoffLinear, BackoffFibonacci, BackoffExponential:
+			c.backoffStrategy = strategy
+		default:
+			// Ignore unsupported values to leave the existing configuration in place.
+		}
+	}
+}
+
+// WithRetryBudget enforces a retry-to-request ratio across a rolling time window.
+// Supplying a zero or negative ratio disables the budget.
+func WithRetryBudget(maxRatio float64, window time.Duration) Option {
+	return func(c *Client) {
+		if maxRatio <= 0 {
+			c.retryBudget = nil
+			return
+		}
+		c.retryBudget = NewRetryBudget(maxRatio, window)
+	}
 }
 
 func WithJitter(b bool) Option {

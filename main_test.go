@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -23,47 +24,92 @@ Helper -----------------------------------------------------------------------
 
 type testServer struct {
 	handler http.HandlerFunc
-	srv     *httptest.Server
+	srv     *http.Server
+	ln      net.Listener
+	url     string
 	calls   int32
 }
 
 func newTestServer(h http.HandlerFunc) *testServer {
-	ts := &testServer{handler: h}
-	ts.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&ts.calls, 1)
-		h(w, r)
-	}))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	ts := &testServer{
+		handler: h,
+		ln:      ln,
+		url:     "http://" + ln.Addr().String(),
+	}
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&ts.calls, 1)
+			h(w, r)
+		}),
+	}
+	ts.srv = srv
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			panic(err)
+		}
+	}()
 	return ts
 }
 
-func (ts *testServer) URL() string { return ts.srv.URL }
+func (ts *testServer) URL() string { return ts.url }
 func (ts *testServer) Calls() int  { return int(atomic.LoadInt32(&ts.calls)) }
-func (ts *testServer) Close()      { ts.srv.Close() }
+func (ts *testServer) Close() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = ts.srv.Shutdown(ctx)
+}
 
 type captureServer struct {
-	srv    *httptest.Server
+	srv    *http.Server
+	ln     net.Listener
+	url    string
 	header http.Header
 	body   []byte
 	mu     sync.Mutex
 }
 
 func newCaptureServer(handler func(w http.ResponseWriter, r *http.Request)) *captureServer {
-	cs := &captureServer{}
-	cs.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cs.mu.Lock()
-		cs.header = r.Header.Clone()
-		if r.Body != nil {
-			cs.body, _ = io.ReadAll(r.Body)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(err)
+	}
+	cs := &captureServer{
+		ln:  ln,
+		url: "http://" + ln.Addr().String(),
+	}
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cs.mu.Lock()
+			cs.header = r.Header.Clone()
+			if r.Body != nil {
+				cs.body, _ = io.ReadAll(r.Body)
+			} else {
+				cs.body = nil
+			}
+			cs.mu.Unlock()
+			handler(w, r)
+		}),
+	}
+	cs.srv = srv
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			panic(err)
 		}
-		cs.mu.Unlock()
-		handler(w, r)
-	}))
+	}()
 	return cs
 }
 
 // helper to spin up a test server that records the request it receives
-func (cs *captureServer) URL() string { return cs.srv.URL }
-func (cs *captureServer) Close()      { cs.srv.Close() }
+func (cs *captureServer) URL() string { return cs.url }
+func (cs *captureServer) Close() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = cs.srv.Shutdown(ctx)
+}
 func (cs *captureServer) Header() http.Header {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
@@ -213,6 +259,46 @@ func TestBackoffCalculation(t *testing.T) {
 	}
 }
 
+func TestBackoffStrategyVariants(t *testing.T) {
+	c := New()
+	c.jitter = false
+	c.minBackoff = 100 * time.Millisecond
+	c.maxBackoff = time.Hour
+
+	c.backoffStrategy = BackoffConstant
+	for attempt := 0; attempt < 3; attempt++ {
+		if got := c.calculateBackoff(attempt, 0); got != c.minBackoff {
+			t.Fatalf("constant strategy: attempt %d, want %v got %v", attempt, c.minBackoff, got)
+		}
+	}
+
+	c.backoffStrategy = BackoffLinear
+	wantLinear := []time.Duration{
+		c.minBackoff,
+		2 * c.minBackoff,
+		3 * c.minBackoff,
+	}
+	for attempt, want := range wantLinear {
+		if got := c.calculateBackoff(attempt, 0); got != want {
+			t.Fatalf("linear strategy: attempt %d, want %v got %v", attempt, want, got)
+		}
+	}
+
+	c.backoffStrategy = BackoffFibonacci
+	wantFib := []time.Duration{
+		c.minBackoff,     // fib(1) = 1
+		c.minBackoff,     // fib(2) = 1
+		2 * c.minBackoff, // fib(3) = 2
+		3 * c.minBackoff, // fib(4) = 3
+		5 * c.minBackoff, // fib(5) = 5
+	}
+	for attempt, want := range wantFib {
+		if got := c.calculateBackoff(attempt, 0); got != want {
+			t.Fatalf("fibonacci strategy: attempt %d, want %v got %v", attempt, want, got)
+		}
+	}
+}
+
 func TestRetryOnTransientError(t *testing.T) {
 	var attempts int32
 	ts := newTestServer(func(w http.ResponseWriter, r *http.Request) {
@@ -240,6 +326,50 @@ func TestRetryOnTransientError(t *testing.T) {
 	}
 	if ts.Calls() != 3 {
 		t.Fatalf("expected 3 attempts, got %d", ts.Calls())
+	}
+}
+
+func TestRetryBudgetLimitsRetries(t *testing.T) {
+	ts := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("fail"))
+	})
+	defer ts.Close()
+
+	ctx := context.Background()
+
+	clientNoBudget := New(WithMaxRetries(5))
+	resp, err := clientNoBudget.Get(ctx, ts.URL(), 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error without budget: %v", err)
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+	callsWithoutBudget := ts.Calls()
+	if callsWithoutBudget <= 1 {
+		t.Fatalf("expected retries without budget, got %d calls", callsWithoutBudget)
+	}
+
+	atomic.StoreInt32(&ts.calls, 0)
+
+	clientWithBudget := New(
+		WithMaxRetries(5),
+		WithRetryBudget(0.3, time.Hour),
+	)
+	resp, err = clientWithBudget.Get(ctx, ts.URL(), 0, nil)
+	if err != nil {
+		t.Fatalf("unexpected error with budget: %v", err)
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+	callsWithBudget := ts.Calls()
+	if callsWithBudget != 2 {
+		t.Fatalf("expected budget to limit retries to 1 additional attempt, got %d calls", callsWithBudget)
+	}
+	if callsWithBudget >= callsWithoutBudget {
+		t.Fatalf("budget should reduce retries: without budget %d, with budget %d", callsWithoutBudget, callsWithBudget)
 	}
 }
 

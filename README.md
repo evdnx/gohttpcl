@@ -5,11 +5,13 @@ A robust and configurable HTTP client package for Go, designed for reliable API 
 ## Features
 
 - **Retries with Exponential Backoff and Jitter** – Automatically retry failed requests with configurable backoff and jitter to prevent server overload.
+- **Backoff Strategies** – Choose from exponential, linear, constant, or Fibonacci delay policies per retry.
 - **Rate Limiting** – Enforce API rate limits (e.g., CoinSpot's 1000 requests per minute) using a token bucket algorithm.
 - **Circuit Breaker** – Prevent overwhelming a failing service by temporarily halting requests after repeated failures.
 - **Logging** – Context‑aware logging with request IDs using [golog](https://github.com/evdnx/golog) for structured logging to stdout, files, or Google Cloud Logging.
 - **Body Buffering** – Buffer request bodies for safe retries, with configurable size limits.
 - **Dynamic Rate Adjustment** – Adjust rate limits based on API response headers (e.g., `X-RateLimit-Remaining`).
+- **Retry Budgets** – Enforce retry-to-request ratios to avoid overwhelming downstream services during outages.
 - **Metrics** – Collect request, retry, failure, and latency metrics via a customizable interface.
 - **Per‑Request Timeouts** – Set timeouts per request, overriding global client settings.
 - **Idempotency Keys** – Automatically generate `Idempotency-Key` headers for specified methods (e.g., `POST`, `PUT`).
@@ -125,6 +127,7 @@ The `gohttpcl` package uses functional options for flexible configuration. Avail
 - `WithMinBackoff(d time.Duration)` – Minimum backoff duration.
 - `WithMaxBackoff(d time.Duration)` – Maximum backoff duration.
 - `WithBackoffFactor(f float64)` – Exponential backoff factor.
+- `WithBackoffStrategy(strategy gohttpcl.BackoffStrategy)` – Select linear, constant, Fibonacci, or exponential delays.
 - `WithJitter(b bool)` – Enable/disable jitter.
 - `WithRetryable(fn func(*http.Response, error) bool)` – Custom retry predicate.
 - `WithTimeout(d time.Duration)` – Global client timeout.
@@ -137,6 +140,7 @@ The `gohttpcl` package uses functional options for flexible configuration. Avail
 - `WithDynamicRateAdjustment()` – Enable dynamic rate‑limit adjustment.
 - `WithRateWindow(d time.Duration)` – Fallback window for dynamic adjustment.
 - `WithMetrics(m MetricsCollector)` – Set metrics collector.
+- `WithRetryBudget(maxRatio float64, window time.Duration)` – Limit total retries over a rolling window.
 - `WithMaxBufferSize(size int64)` – Max request‑body buffer size (`0` = unlimited).
 - `WithRateLimitHeaderPrefix(prefix string)` – Custom header prefix for rate‑limit info.
 - `WithIdempotencyMethods(methods ...string)` – Enable idempotency keys for given methods.
