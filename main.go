@@ -31,6 +31,102 @@ import (
 // Option configures a Client.
 type Option func(*Client)
 
+// ErrValidationFailed is returned (and detectable via errors.Is) when a
+// user-provided response validation function rejects a response.
+var ErrValidationFailed = errors.New("validation failed")
+
+// ValidationError wraps the user-provided validation error and exposes the
+// HTTP response for structured inspection (status code, headers, body).
+type ValidationError struct {
+	// Response is the HTTP response at the time of validation failure. Its body
+	// is safe to read (rewound into memory). Callers should treat this as
+	// read-only and close the body when done.
+	Response *http.Response
+	// Cause is the original error returned by the validation function.
+	Cause error
+
+	bodyOnce   sync.Once
+	bodyCache  []byte
+	bodyErr    error
+	bodyCached bool
+}
+
+func (e *ValidationError) Error() string {
+	if e == nil {
+		return ErrValidationFailed.Error()
+	}
+	return fmt.Sprintf("%s: %v", ErrValidationFailed, e.Cause)
+}
+
+func (e *ValidationError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+func (e *ValidationError) Is(target error) bool {
+	return target == ErrValidationFailed
+}
+
+// StatusCode returns the response status code, or 0 if the response is nil.
+func (e *ValidationError) StatusCode() int {
+	if e == nil || e.Response == nil {
+		return 0
+	}
+	return e.Response.StatusCode
+}
+
+// HeaderSnapshot returns a shallow copy of the response headers, or nil if
+// the response is nil.
+func (e *ValidationError) HeaderSnapshot() http.Header {
+	if e == nil || e.Response == nil {
+		return nil
+	}
+	return e.Response.Header.Clone()
+}
+
+// BodyBytes returns a copy of the response body associated with the validation
+// failure. The underlying response body is rewound so callers can still read it
+// afterwards. A cached copy is reused on subsequent calls.
+func (e *ValidationError) BodyBytes() ([]byte, error) {
+	if e == nil {
+		return nil, errors.New("validation error is nil")
+	}
+	if e.bodyCached {
+		e.Response.Body = io.NopCloser(bytes.NewReader(e.bodyCache))
+		return append([]byte(nil), e.bodyCache...), nil
+	}
+	e.bodyOnce.Do(func() {
+		if e.Response == nil || e.Response.Body == nil {
+			e.bodyErr = errors.New("validation error has no response body")
+			return
+		}
+		data, err := io.ReadAll(e.Response.Body)
+		if err != nil {
+			e.bodyErr = err
+			return
+		}
+		e.bodyCache = data
+		e.bodyCached = true
+		e.Response.Body = io.NopCloser(bytes.NewReader(data))
+	})
+	if e.bodyErr != nil {
+		return nil, e.bodyErr
+	}
+	return append([]byte(nil), e.bodyCache...), nil
+}
+
+// Close drains and closes the underlying response body, returning any close
+// error. Safe to call multiple times.
+func (e *ValidationError) Close() error {
+	if e == nil || e.Response == nil || e.Response.Body == nil {
+		return nil
+	}
+	_, _ = io.Copy(io.Discard, e.Response.Body)
+	return e.Response.Body.Close()
+}
+
 // MetricsCollector defines an interface for collecting metrics.
 type MetricsCollector interface {
 	IncRequests(method, url string)
@@ -785,6 +881,38 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	}
 
 	// -----------------------------------------------------------------
+	// 2a️⃣ Optional response validation (e.g., status/content‑type checks).
+	//      On validation failure we drain & close the body to avoid leaks,
+	//      and count the failure when the status would otherwise be treated
+	//      as a success (so circuit‑breaker/metrics stay consistent).
+	// -----------------------------------------------------------------
+	if c.validateResponse != nil {
+		var cachedBody []byte
+		if verr := c.validateResponse(resp); verr != nil {
+			if resp != nil && resp.Body != nil {
+				bodyBytes, readErr := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if readErr != nil {
+					return nil, fmt.Errorf("reading response body after validation failure: %w", readErr)
+				}
+				resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+				cachedBody = bodyBytes
+			}
+			if resp != nil &&
+				resp.StatusCode >= http.StatusOK &&
+				resp.StatusCode < http.StatusMultipleChoices {
+				recordFailure(c, req, resp.StatusCode)
+			}
+			return resp, &ValidationError{
+				Response:   resp,
+				Cause:      verr,
+				bodyCache:  cachedBody,
+				bodyCached: cachedBody != nil,
+			}
+		}
+	}
+
+	// -----------------------------------------------------------------
 	// 3️⃣ Optional logging / metrics can be added here without touching
 	//    the body again.
 	// -----------------------------------------------------------------
@@ -848,11 +976,11 @@ func (c *Client) Get(
 		// Preserve original behaviour for url.Error unwrapping.
 		if ue, ok := err.(*neturl.Error); ok {
 			if ue.Err != nil {
-				return nil, ue.Err
+				return resp, ue.Err
 			}
-			return nil, ue
+			return resp, ue
 		}
-		return nil, err
+		return resp, err
 	}
 	if out != nil {
 		if err = readAndDecode(resp, out); err != nil {
@@ -885,11 +1013,11 @@ func (c *Client) Post(
 	if err != nil {
 		if ue, ok := err.(*neturl.Error); ok {
 			if ue.Err != nil {
-				return nil, ue.Err
+				return resp, ue.Err
 			}
-			return nil, ue
+			return resp, ue
 		}
-		return nil, err
+		return resp, err
 	}
 	if out != nil {
 		if err = readAndDecode(resp, out); err != nil {
@@ -922,11 +1050,11 @@ func (c *Client) Put(
 	if err != nil {
 		if ue, ok := err.(*neturl.Error); ok {
 			if ue.Err != nil {
-				return nil, ue.Err
+				return resp, ue.Err
 			}
-			return nil, ue
+			return resp, ue
 		}
-		return nil, err
+		return resp, err
 	}
 	if out != nil {
 		if err = readAndDecode(resp, out); err != nil {
@@ -958,11 +1086,11 @@ func (c *Client) Delete(
 	if err != nil {
 		if ue, ok := err.(*neturl.Error); ok {
 			if ue.Err != nil {
-				return nil, ue.Err
+				return resp, ue.Err
 			}
-			return nil, ue
+			return resp, ue
 		}
-		return nil, err
+		return resp, err
 	}
 	if out != nil {
 		if err = readAndDecode(resp, out); err != nil {
@@ -1165,4 +1293,21 @@ func WithIdempotencyMethods(methods ...string) Option {
 
 func WithResponseValidation(validate func(*http.Response) error) Option {
 	return func(c *Client) { c.validateResponse = validate }
+}
+
+// IsValidationError reports whether err was produced by a response validation
+// failure (ErrValidationFailed), allowing callers to branch on validation
+// errors while preserving the underlying cause.
+func IsValidationError(err error) bool {
+	return errors.Is(err, ErrValidationFailed)
+}
+
+// AsValidationError extracts a *ValidationError if present, returning the
+// typed error and a boolean indicating success.
+func AsValidationError(err error) (*ValidationError, bool) {
+	var ve *ValidationError
+	if errors.As(err, &ve) {
+		return ve, true
+	}
+	return nil, false
 }

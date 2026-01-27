@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -545,6 +546,74 @@ func TestJSONDecoding(t *testing.T) {
 	}
 	if out.Value != "hello" {
 		t.Fatalf("unexpected decoded value: %s", out.Value)
+	}
+}
+
+func TestResponseValidationIsApplied(t *testing.T) {
+	ts := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("oops body"))
+	})
+	defer ts.Close()
+
+	c := New(
+		WithResponseValidation(func(resp *http.Response) error {
+			if !strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
+				return fmt.Errorf("unexpected content type: %s", resp.Header.Get("Content-Type"))
+			}
+			return nil
+		}),
+	)
+
+	resp, err := c.Get(context.Background(), ts.URL(), 0, nil)
+	if err == nil {
+		t.Fatalf("expected validation error")
+	}
+	if !IsValidationError(err) {
+		t.Fatalf("expected IsValidationError to detect validation failure, got %v", err)
+	}
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("expected ValidationError type")
+	}
+	if ve.Response == nil {
+		t.Fatalf("expected ValidationError to carry response")
+	}
+	if resp == nil || resp.Body == nil {
+		t.Fatalf("expected response (with body) to be returned alongside error")
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		t.Fatalf("failed to read returned body: %v", readErr)
+	}
+	if string(body) != "oops body" {
+		t.Fatalf("unexpected body content: %q", body)
+	}
+
+	// BodyBytes should cache and keep the body reusable.
+	bytes1, berr := ve.BodyBytes()
+	if berr != nil {
+		t.Fatalf("BodyBytes error: %v", berr)
+	}
+	if string(bytes1) != "oops body" {
+		t.Fatalf("BodyBytes content mismatch: %q", bytes1)
+	}
+	// Second call should return same bytes without error.
+	bytes2, berr := ve.BodyBytes()
+	if berr != nil {
+		t.Fatalf("BodyBytes second call error: %v", berr)
+	}
+	if string(bytes2) != "oops body" {
+		t.Fatalf("BodyBytes second content mismatch: %q", bytes2)
+	}
+	// Response body should remain readable after BodyBytes.
+	again, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		t.Fatalf("failed to reread body after BodyBytes: %v", readErr)
+	}
+	if string(again) != "oops body" {
+		t.Fatalf("unexpected reread content: %q", again)
 	}
 }
 

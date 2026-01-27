@@ -19,6 +19,7 @@ A robust and configurable HTTP client package for Go, designed for reliable API 
 - **JSON Unmarshalling** – Optionally unmarshal JSON responses into a user‑provided struct or map.
 - **Full HTTP Verb Support** – `GET`, `POST`, `PUT`, `DELETE` helpers (all honour the same feature set).
 - **Header Management** – Merge default headers with per‑request headers, support multi‑value headers, and allow explicit overrides.
+- **Validation Error Introspection** – When `WithResponseValidation` rejects a response, the returned error wraps `ErrValidationFailed` and includes the original `*http.Response`, allowing callers to inspect status, headers, or body while still using `errors.Is(err, ErrValidationFailed)` or `gohttpcl.IsValidationError(err)`.
 
 ## Installation
 
@@ -145,6 +146,23 @@ The `gohttpcl` package uses functional options for flexible configuration. Avail
 - `WithRateLimitHeaderPrefix(prefix string)` – Custom header prefix for rate‑limit info.
 - `WithIdempotencyMethods(methods ...string)` – Enable idempotency keys for given methods.
 - `WithResponseValidation(fn func(*http.Response) error)` – Set response validator.
+- `ErrValidationFailed` / `IsValidationError(err error)` – Detect validation failures via `errors.Is(err, gohttpcl.ErrValidationFailed)` or the helper. Validation errors are returned as `*gohttpcl.ValidationError` carrying the `*http.Response` for inspection.
+- `(*ValidationError).StatusCode()` / `HeaderSnapshot()` – Convenience accessors so callers can read status and headers without touching the raw response.
+- `(*ValidationError).BodyBytes()` – Returns a cached copy of the response body and rewinds it so callers can still read.
+- `(*ValidationError).Close()` – Drains and closes the response body safely (idempotent).
+- `AsValidationError(err error) (*ValidationError, bool)` – Convenience extractor to avoid manual `errors.As`.
+
+### Handling validation failures
+
+```go
+resp, err := client.Get(ctx, url, 5*time.Second, nil)
+if ve, ok := gohttpcl.AsValidationError(err); ok {
+	defer ve.Close()
+	body, _ := ve.BodyBytes()
+	fmt.Printf("status=%d headers=%v body=%s cause=%v\n",
+		ve.StatusCode(), ve.HeaderSnapshot(), body, ve.Unwrap())
+}
+```
 
 ## Key Features in Detail
 
